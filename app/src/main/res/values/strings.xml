@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">MangaAutoScroller</string>
+    <string name="accessibility_service_description">Enables automatic scrolling for manga reading. This service is required to perform scrolling gestures on your screen.</string>
+    <string name="text_detection_service_description">Smart text detection using ML Kit OCR. Analyzes text density to provide adaptive scrolling speed for optimal manga reading experience.</string>
+    <string name="accessibility_permission_title">Accessibility Permission Required</string>
+    <string name="accessibility_permission_message">This app needs Accessibility permission to perform automatic scrolling. Please enable the Manga Auto Scroller in your Accessibility settings.</string>
+    <string name="go_to_settings">Go to Settings</string>
+    <string name="cancel">Cancel</string>
+</resources>

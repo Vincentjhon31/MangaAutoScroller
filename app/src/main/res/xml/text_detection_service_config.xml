@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewScrolled|typeWindowContentChanged|typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:description="@string/text_detection_service_description"
+    android:notificationTimeout="100"
+    android:packageNames="com.android.chrome,org.mozilla.firefox,com.brave.browser,com.UCMobile.intl,com.opera.browser,com.microsoft.emmx,com.sec.android.app.sbrowser,com.android.browser,com.mangareader.android,com.manga.rock,com.tachiyomi"
+    android:settingsActivity=".MainActivity" />
+
