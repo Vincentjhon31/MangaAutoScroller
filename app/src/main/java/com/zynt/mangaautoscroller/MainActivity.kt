@@ -33,7 +33,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.zynt.mangaautoscroller.service.ScrollerOverlayService
 import com.zynt.mangaautoscroller.ui.SettingsDialog
 import com.zynt.mangaautoscroller.ui.theme.MangaAutoScrollerTheme
@@ -45,11 +44,27 @@ class MainActivity : ComponentActivity() {
     // MediaProjection for screen capture and OCR
     private var mediaProjectionData: Intent? = null
 
-    // Settings state
+    // Settings state with shared preferences backing
     private var scrollSpeed by mutableStateOf(2.0f)
     private var overlayOpacity by mutableStateOf(0.85f)
     private var ocrEnabled by mutableStateOf(true)
+    private var adaptiveScrollingEnabled by mutableStateOf(true)
+    private var textDetectionSensitivity by mutableStateOf(1.0f)
+    private var adaptiveResponseStrength by mutableStateOf(1.0f)
     private var showSettingsDialog by mutableStateOf(false)
+
+    // Shared preferences constants
+    companion object {
+        private const val PREFS_NAME = "MangaScrollerPrefs"
+        private const val KEY_SCROLL_SPEED = "scroll_speed"
+        private const val KEY_DIRECTION = "scroll_direction"
+        private const val KEY_OPACITY = "overlay_opacity"
+        private const val KEY_ADAPTIVE_ENABLED = "adaptive_enabled"
+        private const val KEY_SENSITIVITY = "text_sensitivity"
+        private const val KEY_RESPONSE_STRENGTH = "response_strength"
+        private const val KEY_OCR_ENABLED = "ocr_enabled"
+        private const val KEY_MEDIA_PROJECTION_DATA = "media_projection_data"
+    }
 
     // Permission launchers
     private val overlayPermissionLauncher = registerForActivityResult(
@@ -82,6 +97,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Load settings from SharedPreferences
+        loadSettings()
+
         // Check all permissions on start
         checkAllPermissions()
         // Check service status periodically
@@ -94,11 +112,24 @@ class MainActivity : ComponentActivity() {
                     SettingsDialog(
                         onDismiss = { showSettingsDialog = false },
                         scrollSpeed = scrollSpeed,
-                        onScrollSpeedChange = { scrollSpeed = it },
+                        onScrollSpeedChange = {
+                            scrollSpeed = it
+                            saveSettings()
+                        },
                         ocrEnabled = ocrEnabled,
-                        onOcrEnabledChange = { ocrEnabled = it },
+                        onOcrEnabledChange = {
+                            ocrEnabled = it
+                            saveSettings()
+                        },
                         overlayOpacity = overlayOpacity,
-                        onOverlayOpacityChange = { overlayOpacity = it }
+                        onOverlayOpacityChange = {
+                            overlayOpacity = it
+                            saveSettings()
+                        },
+                        onReset = {
+                            resetSettingsToDefaults()
+                            Toast.makeText(this, "Settings reset to defaults", Toast.LENGTH_SHORT).show()
+                        }
                     )
                 }
 
@@ -131,7 +162,16 @@ class MainActivity : ComponentActivity() {
                                 checkServiceStatus()
                             }
                         },
-                        onOpenSettings = { showSettingsDialog = true }
+                        onOpenSettings = { showSettingsDialog = true },
+                        scrollSpeed = scrollSpeed,
+                        onScrollSpeedChange = {
+                            scrollSpeed = it
+                            saveSettings()
+                        },
+                        onReset = {
+                            resetSettingsToDefaults()
+                            Toast.makeText(this, "Settings reset to defaults", Toast.LENGTH_SHORT).show()
+                        }
                     )
                 }
             }
@@ -229,7 +269,26 @@ class MainActivity : ComponentActivity() {
         try {
             val intent = Intent(this, ScrollerOverlayService::class.java)
 
-            // Remove the problematic MediaProjection code that was causing crashes
+            // Pass settings from MainActivity to service
+            val speedMultiplier = scrollSpeed
+            // Convert UI speed multiplier to actual delay in milliseconds
+            val baseScrollSpeed = (2000L / speedMultiplier).toLong()
+
+            // Add settings as extras to the intent
+            intent.putExtra(KEY_SCROLL_SPEED, baseScrollSpeed)
+            intent.putExtra(KEY_OPACITY, overlayOpacity)
+            intent.putExtra(KEY_ADAPTIVE_ENABLED, adaptiveScrollingEnabled)
+            intent.putExtra(KEY_SENSITIVITY, textDetectionSensitivity)
+            intent.putExtra(KEY_RESPONSE_STRENGTH, adaptiveResponseStrength)
+            intent.putExtra(KEY_OCR_ENABLED, ocrEnabled)
+
+            // Pass MediaProjection result data to the service if OCR is enabled
+            if (ocrEnabled && mediaProjectionData != null) {
+                intent.putExtra(KEY_MEDIA_PROJECTION_DATA, mediaProjectionData)
+                Log.d(TAG, "Passing MediaProjection data to service for OCR")
+            }
+
+            // Start the service
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)
             } else {
@@ -274,6 +333,39 @@ class MainActivity : ComponentActivity() {
             serviceRunning = false
         }
     }
+
+    private fun loadSettings() {
+        val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        scrollSpeed = sharedPreferences.getFloat(KEY_SCROLL_SPEED, 2.0f)
+        overlayOpacity = sharedPreferences.getFloat(KEY_OPACITY, 0.85f)
+        ocrEnabled = sharedPreferences.getBoolean(KEY_OCR_ENABLED, true)
+        adaptiveScrollingEnabled = sharedPreferences.getBoolean(KEY_ADAPTIVE_ENABLED, true)
+        textDetectionSensitivity = sharedPreferences.getFloat(KEY_SENSITIVITY, 1.0f)
+        adaptiveResponseStrength = sharedPreferences.getFloat(KEY_RESPONSE_STRENGTH, 1.0f)
+    }
+
+    private fun saveSettings() {
+        val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        with(sharedPreferences.edit()) {
+            putFloat(KEY_SCROLL_SPEED, scrollSpeed)
+            putFloat(KEY_OPACITY, overlayOpacity)
+            putBoolean(KEY_OCR_ENABLED, ocrEnabled)
+            putBoolean(KEY_ADAPTIVE_ENABLED, adaptiveScrollingEnabled)
+            putFloat(KEY_SENSITIVITY, textDetectionSensitivity)
+            putFloat(KEY_RESPONSE_STRENGTH, adaptiveResponseStrength)
+            apply()
+        }
+    }
+
+    private fun resetSettingsToDefaults() {
+        scrollSpeed = 2.0f
+        overlayOpacity = 0.85f
+        ocrEnabled = true
+        adaptiveScrollingEnabled = true
+        textDetectionSensitivity = 1.0f
+        adaptiveResponseStrength = 1.0f
+        saveSettings()
+    }
 }
 
 @Composable
@@ -286,7 +378,10 @@ fun EnhancedMangaScrollerMainScreen(
     onRequestMediaProjection: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
     onToggleService: (Boolean) -> Unit,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    scrollSpeed: Float = 2.0f,
+    onScrollSpeedChange: (Float) -> Unit = {},
+    onReset: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showInstructions by remember { mutableStateOf(false) }
@@ -392,12 +487,90 @@ fun EnhancedMangaScrollerMainScreen(
             onToggleService = onToggleService
         )
 
-        // Quick Actions
-        QuickActionsCard(
-            showInstructions = showInstructions,
-            onToggleInstructions = { showInstructions = !showInstructions },
-            onOpenSettings = { onOpenSettings() }
-        )
+        // Quick Actions - Fixed version with proper variable references
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 8.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Text(
+                    text = "Quick Actions",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Quick speed adjustment
+                Text(
+                    text = "Scroll Speed: ${String.format("%.1f", scrollSpeed)}x",
+                    style = MaterialTheme.typography.bodySmall
+                )
+
+                Slider(
+                    value = scrollSpeed,
+                    onValueChange = onScrollSpeedChange,
+                    valueRange = 0.5f..5f,
+                    steps = 18,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { showInstructions = !showInstructions },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = if (showInstructions) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(if (showInstructions) "Hide Guide" else "Show Guide")
+                    }
+
+                    OutlinedButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Settings")
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Reset button
+                OutlinedButton(
+                    onClick = onReset,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Reset to Defaults")
+                }
+            }
+        }
 
         // Instructions (collapsible)
         AnimatedVisibility(visible = showInstructions) {
@@ -698,62 +871,6 @@ fun FeatureStatusIndicator(
             style = MaterialTheme.typography.labelSmall,
             color = if (enabled) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
         )
-    }
-}
-
-@Composable
-fun QuickActionsCard(
-    showInstructions: Boolean,
-    onToggleInstructions: () -> Unit,
-    onOpenSettings: () -> Unit
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 8.dp)
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp)
-        ) {
-            Text(
-                text = "Quick Actions",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedButton(
-                    onClick = onToggleInstructions,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(
-                        imageVector = if (showInstructions) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(if (showInstructions) "Hide Guide" else "Show Guide")
-                }
-
-                OutlinedButton(
-                    onClick = onOpenSettings,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Settings,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Settings")
-                }
-            }
-        }
     }
 }
 

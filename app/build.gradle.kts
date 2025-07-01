@@ -48,6 +48,8 @@ android {
         exclude("META-INF/ASL2.0")
         jniLibs {
             useLegacyPackaging = false
+            // Add explicit configuration for 16 KB page size alignment
+            pickFirsts += listOf("**/*.so")
         }
     }
 }
@@ -65,7 +67,7 @@ dependencies {
     implementation(libs.androidx.material3)
 
     // ML Kit for text recognition (for adaptive scrolling)
-    implementation("com.google.mlkit:text-recognition:16.0.0")
+    implementation("com.google.mlkit:text-recognition:16.0.0-beta4")
 
     // Coil for image loading
     implementation("io.coil-kt:coil-compose:2.6.0")

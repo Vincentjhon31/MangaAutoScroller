@@ -3,15 +3,28 @@ package com.zynt.mangaautoscroller.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.Image
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.*
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.zynt.mangaautoscroller.MainActivity
 import com.zynt.mangaautoscroller.R
 import kotlinx.coroutines.*
+import android.content.pm.ServiceInfo
 
 /**
  * Simplified ScrollerOverlayService that eliminates crash-causing dependencies
@@ -54,16 +67,105 @@ class ScrollerOverlayService : Service() {
     private var overlayOpacity = 0.85f
     private var isExpanded = false
 
+    // SharedPreferences key constants
     companion object {
         private const val NOTIFICATION_ID = 1337
         private const val CHANNEL_ID = "ScrollerOverlayChannel"
         private const val TAG = "ScrollerOverlayService"
+
+        // Preference keys
+        private const val PREFS_NAME = "MangaScrollerPrefs"
+        private const val KEY_SCROLL_SPEED = "scroll_speed"
+        private const val KEY_DIRECTION = "scroll_direction"
+        private const val KEY_OPACITY = "overlay_opacity"
+        private const val KEY_ADAPTIVE_ENABLED = "adaptive_enabled"
+        private const val KEY_SENSITIVITY = "text_sensitivity"
+        private const val KEY_RESPONSE_STRENGTH = "response_strength"
     }
+
+    // OCR and MediaProjection variables
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var screenDensity: Int = 0
+    private var screenWidth: Int = 0
+    private var screenHeight: Int = 0
+    private var ocrEnabled = false
+
+    // OCR Recognizer
+    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private var ocrCaptureJob: Job? = null
+
+    // OCR Status tracking
+    private var ocrStatus = OCRStatus.DISABLED
+    private var lastOCRProcessTime = 0L
+    private var ocrSuccessCount = 0
+    private var ocrFailureCount = 0
+    private var lastOCRError: String? = null
+    private var ocrStartTime = 0L
+    private var lastDetectedText = "No text detected yet"
+    private var detectionMethod = "None"
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service created")
         createNotificationChannel()
+
+        // Load saved settings when service is created
+        loadSavedSettings()
+    }
+
+    // Add methods to save and load settings
+    private fun loadSavedSettings() {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+            // Load scroll speed with type migration handling
+            try {
+                baseScrollSpeed = prefs.getLong(KEY_SCROLL_SPEED, 2000L)
+            } catch (e: ClassCastException) {
+                // The value might have been saved as a Float previously
+                Log.w(TAG, "Migrating scroll speed from Float to Long")
+                val floatValue = prefs.getFloat(KEY_SCROLL_SPEED, 2000f)
+                baseScrollSpeed = floatValue.toLong()
+                // Save it back as Long to prevent future errors
+                prefs.edit().putLong(KEY_SCROLL_SPEED, baseScrollSpeed).apply()
+            }
+
+            // Load other settings
+            currentDirection = prefs.getInt(KEY_DIRECTION, ScrollerAccessibilityService.DIRECTION_DOWN)
+            overlayOpacity = prefs.getFloat(KEY_OPACITY, 0.85f)
+            adaptiveScrollingEnabled = prefs.getBoolean(KEY_ADAPTIVE_ENABLED, true)
+            textDetectionSensitivity = prefs.getFloat(KEY_SENSITIVITY, 1.0f)
+            adaptiveResponseStrength = prefs.getFloat(KEY_RESPONSE_STRENGTH, 1.0f)
+
+            Log.d(TAG, "Settings loaded: speed=$baseScrollSpeed, direction=$currentDirection")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading settings", e)
+            // If loading fails, we'll use the default values
+        }
+    }
+
+    private fun saveSettings() {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val editor = prefs.edit()
+
+            // Save all current settings
+            editor.putLong(KEY_SCROLL_SPEED, baseScrollSpeed)
+            editor.putInt(KEY_DIRECTION, currentDirection)
+            editor.putFloat(KEY_OPACITY, overlayOpacity)
+            editor.putBoolean(KEY_ADAPTIVE_ENABLED, adaptiveScrollingEnabled)
+            editor.putFloat(KEY_SENSITIVITY, textDetectionSensitivity)
+            editor.putFloat(KEY_RESPONSE_STRENGTH, adaptiveResponseStrength)
+
+            // Apply changes
+            editor.apply()
+
+            Log.d(TAG, "Settings saved: speed=$baseScrollSpeed, direction=$currentDirection")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving settings", e)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,6 +173,7 @@ class ScrollerOverlayService : Service() {
 
         when (intent?.action) {
             "STOP_SERVICE" -> {
+                stopOCRCapture()
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -85,8 +188,44 @@ class ScrollerOverlayService : Service() {
         }
 
         try {
-            // Start foreground service
-            startForeground(NOTIFICATION_ID, createNotification())
+            // Start foreground service with correct type for media projection FIRST
+            // This must happen before any MediaProjection operations
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    createNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, createNotification())
+            }
+
+            // Extract settings from intent
+            intent?.let { serviceIntent ->
+                baseScrollSpeed = serviceIntent.getLongExtra("scroll_speed", 2000L)
+                overlayOpacity = serviceIntent.getFloatExtra("overlay_opacity", 0.85f)
+                adaptiveScrollingEnabled = serviceIntent.getBooleanExtra("adaptive_enabled", true)
+                textDetectionSensitivity = serviceIntent.getFloatExtra("text_sensitivity", 1.0f)
+                adaptiveResponseStrength = serviceIntent.getFloatExtra("response_strength", 1.0f)
+                ocrEnabled = serviceIntent.getBooleanExtra("ocr_enabled", false)
+
+                // Setup OCR if enabled and MediaProjection data is available
+                val mediaProjectionData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    serviceIntent.getParcelableExtra("media_projection_data", Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    serviceIntent.getParcelableExtra("media_projection_data")
+                }
+
+                if (ocrEnabled && mediaProjectionData != null) {
+                    setupOCRCapture(mediaProjectionData)
+                    Log.d(TAG, "✅ OCR capture setup completed")
+                } else {
+                    Log.i(TAG, "OCR not enabled or MediaProjection data not available")
+                }
+            }
+
 
             // Create simple overlay
             createSimpleOverlay()
@@ -102,11 +241,515 @@ class ScrollerOverlayService : Service() {
         return START_STICKY
     }
 
+    /**
+     * Setup OCR screen capture using MediaProjection
+     */
+    private fun setupOCRCapture(mediaProjectionData: Intent) {
+        try {
+            updateOCRStatus(OCRStatus.INITIALIZING)
+            ocrStartTime = System.currentTimeMillis()
+
+            val mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, mediaProjectionData)
+
+            // Get screen dimensions
+            val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val metrics = DisplayMetrics()
+
+            // Use the WindowManager to get display metrics instead of trying to access display directly
+            // This works in a service context without requiring a direct display association
+            val defaultDisplay = windowManager.defaultDisplay
+            defaultDisplay.getMetrics(metrics)
+
+            screenDensity = metrics.densityDpi
+            screenWidth = metrics.widthPixels
+            screenHeight = metrics.heightPixels
+
+            // Create ImageReader for screen capture
+            imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
+
+            // Register a MediaProjection callback - required starting with Android 12
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        Log.d(TAG, "MediaProjection stopped")
+                        stopOCRCapture()
+                    }
+                }, Handler(Looper.getMainLooper()))
+            }
+            // Create VirtualDisplay
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "MangaOCRCapture",
+                screenWidth,
+                screenHeight,
+                screenDensity,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader?.surface,
+                null,
+                null
+            )
+
+            // Start periodic OCR capture
+            startOCRCaptureLoop()
+            updateOCRStatus(OCRStatus.READY)
+
+            Log.d(TAG, "OCR capture setup completed: ${screenWidth}x${screenHeight} @ ${screenDensity}dpi")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting up OCR capture", e)
+            lastOCRError = e.message
+            updateOCRStatus(OCRStatus.ERROR)
+            ocrEnabled = false
+        }
+    }
+
+    /**
+     * Start the OCR capture loop
+     */
+    private fun startOCRCaptureLoop() {
+        ocrCaptureJob = coroutineScope.launch {
+            while (ocrEnabled && isActive && virtualDisplay != null) {
+                try {
+                    delay(textAnalysisInterval) // Wait between captures
+                    if (adaptiveScrollingEnabled && isScrolling) {
+                        captureAndProcessScreen()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in OCR capture loop", e)
+                    break
+                }
+            }
+        }
+    }
+
+    /**
+     * Capture screen and process with ML Kit OCR
+     */
+    private fun captureAndProcessScreen() {
+        try {
+            val image = imageReader?.acquireLatestImage()
+            if (image != null) {
+                val bitmap = imageToBitmap(image)
+                image.close()
+
+                bitmap?.let { bmp ->
+                    processImageWithMLKit(bmp)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error capturing and processing screen", e)
+        }
+    }
+
+    /**
+     * Convert Image to Bitmap for ML Kit processing
+     */
+    private fun imageToBitmap(image: Image): Bitmap? {
+        try {
+            val planes = image.planes
+            val buffer = planes[0].buffer
+            val pixelStride = planes[0].pixelStride
+            val rowStride = planes[0].rowStride
+            val rowPadding = rowStride - pixelStride * image.width
+
+            val bitmap = Bitmap.createBitmap(
+                image.width + rowPadding / pixelStride,
+                image.height,
+                Bitmap.Config.ARGB_8888
+            )
+            bitmap.copyPixelsFromBuffer(buffer)
+
+            // Return the exact size bitmap
+            return if (rowPadding == 0) {
+                bitmap
+            } else {
+                val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+                bitmap.recycle()
+                croppedBitmap
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error converting image to bitmap", e)
+            return null
+        }
+    }
+
+    /**
+     * Process bitmap with ML Kit Text Recognition
+     */
+    private fun processImageWithMLKit(bitmap: Bitmap) {
+        try {
+            updateOCRStatus(OCRStatus.PROCESSING)
+            lastOCRProcessTime = System.currentTimeMillis()
+
+            val inputImage = InputImage.fromBitmap(bitmap, 0)
+            recognizer.process(inputImage)
+                .addOnSuccessListener { visionText ->
+                    // Successfully extracted text
+                    val extractedText = visionText.text
+                    val textBlocks = visionText.textBlocks
+
+                    // Update success count and status
+                    ocrSuccessCount++
+                    updateOCRStatus(OCRStatus.READY)
+
+                    Log.d(TAG, "OCR Success: Found ${textBlocks.size} text blocks")
+                    Log.v(TAG, "Extracted text: $extractedText")
+
+                    // Analyze the text for adaptive scrolling
+                    analyzeOCRResults(extractedText, textBlocks)
+
+                    // Clean up bitmap
+                    bitmap.recycle()
+                }
+                .addOnFailureListener { exception ->
+                    // OCR failed - update failure count and status
+                    ocrFailureCount++
+                    lastOCRError = exception.message
+                    updateOCRStatus(OCRStatus.ERROR)
+
+                    Log.w(TAG, "OCR failed", exception)
+                    bitmap.recycle()
+
+                    // Return to READY status after a brief delay
+                    coroutineScope.launch {
+                        delay(2000) // Wait 2 seconds before marking as ready again
+                        if (ocrStatus == OCRStatus.ERROR) {
+                            updateOCRStatus(OCRStatus.READY)
+                        }
+                    }
+                }
+        } catch (e: Exception) {
+            ocrFailureCount++
+            lastOCRError = e.message
+            updateOCRStatus(OCRStatus.ERROR)
+
+            Log.e(TAG, "Error processing image with ML Kit", e)
+            bitmap.recycle()
+        }
+    }
+
+    /**
+     * Analyze OCR results for adaptive scrolling decisions
+     */
+    private fun analyzeOCRResults(text: String, textBlocks: List<com.google.mlkit.vision.text.Text.TextBlock>) {
+        try {
+            // Calculate text density based on actual OCR results
+            val textDensity = calculateTextDensityFromOCR(textBlocks)
+
+            // Check for end-of-chapter/page indicators
+            val isEndOfPage = detectEndOfPage(text)
+
+            // Check for dense dialogue sections
+            val isDenseText = detectDenseText(textBlocks)
+
+            // Update text density history
+            textDensityHistory.add(textDensity)
+            if (textDensityHistory.size > 5) {
+                textDensityHistory.removeAt(0)
+            }
+
+            // Calculate average text density
+            averageTextDensity = textDensityHistory.average().toFloat()
+            currentTextDensity = textDensity
+
+            // Log analysis results
+            Log.d(TAG, "OCR Analysis: density=$textDensity, endOfPage=$isEndOfPage, dense=$isDenseText")
+
+            // Apply adaptive scrolling decisions
+            if (isEndOfPage) {
+                Log.i(TAG, "End of page detected - pausing scroll")
+                // Optionally pause scrolling or slow it down significantly
+                // stopScrolling() // Uncomment if you want to auto-pause at end of page
+            } else if (isDenseText) {
+                Log.i(TAG, "Dense text detected - using slower scroll speed")
+                // The adaptive speed calculation will handle this automatically
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error analyzing OCR results", e)
+        }
+    }
+
+    /**
+     * Calculate text density from actual OCR results
+     */
+    private fun calculateTextDensityFromOCR(textBlocks: List<com.google.mlkit.vision.text.Text.TextBlock>): Float {
+        if (textBlocks.isEmpty()) return 0.0f
+
+        try {
+            // Calculate the total area covered by text
+            var totalTextArea = 0
+            val screenArea = screenWidth * screenHeight
+
+            for (block in textBlocks) {
+                val boundingBox = block.boundingBox
+                if (boundingBox != null) {
+                    val area = boundingBox.width() * boundingBox.height()
+                    totalTextArea += area
+                }
+            }
+
+            // Calculate density as percentage of screen covered by text
+            val baseDensity = totalTextArea.toFloat() / screenArea.toFloat()
+
+            // Apply sensitivity multiplier
+            return baseDensity * textDetectionSensitivity
+        } catch (e: Exception) {
+            Log.e(TAG, "Error calculating text density from OCR", e)
+            return 0.0f
+        }
+    }
+
+    /**
+     * Detect end of page/chapter indicators in text
+     */
+    private fun detectEndOfPage(text: String): Boolean {
+        val endIndicators = listOf(
+            "end of chapter",
+            "to be continued",
+            "continued next time",
+            "next chapter",
+            "chapter end",
+            "終わり", // Japanese: end
+            "続く", // Japanese: to be continued
+            "次回", // Japanese: next time
+            "第.*話.*終", // Japanese: end of episode/chapter
+            "fin",
+            "the end"
+        )
+
+        val lowerText = text.lowercase()
+        return endIndicators.any { indicator ->
+            lowerText.contains(indicator.lowercase())
+        }
+    }
+
+    /**
+     * Detect dense text sections (lots of dialogue)
+     */
+    private fun detectDenseText(textBlocks: List<com.google.mlkit.vision.text.Text.TextBlock>): Boolean {
+        // Consider it dense if there are many text blocks or large blocks
+        val blockCount = textBlocks.size
+        val hasLargeBlocks = textBlocks.any { block ->
+            val boundingBox = block.boundingBox
+            boundingBox != null && boundingBox.width() > screenWidth * 0.3
+        }
+
+        return blockCount > 5 || hasLargeBlocks
+    }
+
+    /**
+     * Stop OCR capture and cleanup resources
+     */
+    private fun stopOCRCapture() {
+        try {
+            ocrCaptureJob?.cancel()
+            virtualDisplay?.release()
+            mediaProjection?.stop()
+            imageReader?.close()
+
+            virtualDisplay = null
+            mediaProjection = null
+            imageReader = null
+
+            Log.d(TAG, "OCR capture stopped and resources cleaned up")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping OCR capture", e)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Log.d(TAG, "🛑 Service destroying...")
+
+        try {
+            stopScrolling()
+            stopOCRCapture()
+            overlayView?.let { windowManager?.removeView(it) }
+            coroutineScope.cancel()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during service destruction", e)
+        }
+
+        Log.d(TAG, "✅ Service destroyed successfully")
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun createRoundedBackground(): android.graphics.drawable.GradientDrawable {
+        return android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+            cornerRadius = 32f
+            setColor(0xFFF7F2FA.toInt()) // Material 3 surface
+            setStroke(2, 0xFFE7E0EC.toInt()) // Material 3 outline
+        }
+    }
+
+    private fun createCircleBackground(color: Int): android.graphics.drawable.GradientDrawable {
+        return android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.OVAL
+            setColor(color)
+        }
+    }
+
+    private fun createButtonBackground(color: Int): android.graphics.drawable.GradientDrawable {
+        return android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+            cornerRadius = 20f
+            setColor(color)
+        }
+    }
+
+    /**
+     * Analyzes the current screen to determine text density
+     */
+    private fun analyzeScreenForTextDensity() {
+        try {
+            // Use OCR if available, otherwise use simulated analysis
+            if (ocrEnabled && virtualDisplay != null) {
+                // OCR analysis is handled in the OCR capture loop
+                return
+            }
+
+            // Fallback to simulated analysis for non-OCR mode
+            val bitmap = captureScreenshot() ?: return
+            val textDensity = calculateTextDensityFromBitmap(bitmap)
+
+            // Update text density history
+            textDensityHistory.add(textDensity)
+            if (textDensityHistory.size > 5) {
+                textDensityHistory.removeAt(0)
+            }
+
+            // Calculate average text density
+            averageTextDensity = textDensityHistory.average().toFloat()
+            currentTextDensity = textDensity
+
+            // Clean up
+            bitmap.recycle()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error analyzing screen for text density", e)
+        }
+    }
+
+    /**
+     * Calculate text density from bitmap image with improved detection
+     */
+    private fun calculateTextDensityFromBitmap(bitmap: android.graphics.Bitmap): Float {
+        val width = bitmap.width
+        val height = bitmap.height
+
+        // Adjusted for sensitivity settings
+        val threshold = 128 - ((textDetectionSensitivity - 1.0f) * 40).toInt()
+        val samplingRate = (11 - textDetectionSensitivity * 5).toInt().coerceAtLeast(1)
+
+        var darkPixels = 0
+        var sampledPixels = 0
+
+        // Sample pixels based on sensitivity settings
+        for (x in 0 until width step samplingRate) {
+            for (y in 0 until height step samplingRate) {
+                sampledPixels++
+                val pixel = bitmap.getPixel(x, y)
+
+                val r = android.graphics.Color.red(pixel)
+                val g = android.graphics.Color.green(pixel)
+                val b = android.graphics.Color.blue(pixel)
+
+                val brightness = (r * 0.299 + g * 0.587 + b * 0.114).toInt()
+
+                if (brightness < threshold) {
+                    darkPixels++
+                }
+
+                // Look for edges (common in text)
+                if (x < width - samplingRate && y < height - samplingRate) {
+                    val pixelRight = bitmap.getPixel(x + samplingRate, y)
+                    val pixelDown = bitmap.getPixel(x, y + samplingRate)
+
+                    val brightRight = (android.graphics.Color.red(pixelRight) * 0.299 +
+                            android.graphics.Color.green(pixelRight) * 0.587 +
+                            android.graphics.Color.blue(pixelRight) * 0.114).toInt()
+
+                    val brightDown = (android.graphics.Color.red(pixelDown) * 0.299 +
+                            android.graphics.Color.green(pixelDown) * 0.587 +
+                            android.graphics.Color.blue(pixelDown) * 0.114).toInt()
+
+                    if (Math.abs(brightness - brightRight) > 40 || Math.abs(brightness - brightDown) > 40) {
+                        darkPixels++
+                    }
+                }
+            }
+        }
+
+        val baseDensity = darkPixels.toFloat() / sampledPixels.coerceAtLeast(1)
+        return baseDensity * textDetectionSensitivity
+    }
+
+    /**
+     * Enhanced simulated screenshot for fallback mode
+     */
+    private fun captureScreenshot(): android.graphics.Bitmap? {
+        try {
+            val displayMetrics = resources.displayMetrics
+            val width = displayMetrics.widthPixels
+            val height = displayMetrics.heightPixels
+
+            return android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888).apply {
+                val canvas = android.graphics.Canvas(this)
+                val paint = android.graphics.Paint().apply {
+                    color = android.graphics.Color.BLACK
+                    textSize = 24f
+                    isAntiAlias = true
+                }
+
+                val random = java.util.Random()
+
+                // Create text-like regions
+                val numPanels = random.nextInt(4) + 2
+                for (i in 0 until numPanels) {
+                    val panelX = random.nextInt(width - 200)
+                    val panelY = random.nextInt(height - 200)
+                    val panelWidth = random.nextInt(200) + 100
+                    val panelHeight = random.nextInt(200) + 100
+
+                    val numLines = random.nextInt(6) + 1
+                    for (line in 0 until numLines) {
+                        val lineY = panelY + (line + 1) * panelHeight / (numLines + 1)
+                        val lineWidth = random.nextInt(panelWidth - 20) + 20
+                        canvas.drawLine(
+                            panelX + 10f,
+                            lineY.toFloat(),
+                            (panelX + 10 + lineWidth).toFloat(),
+                            lineY.toFloat(),
+                            paint
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating simulated screenshot", e)
+            return null
+        }
+    }
+
+    /**
+     * Calculate adaptive scroll speed based on text density
+     */
+    private fun calculateAdaptiveScrollSpeed(): Long {
+        val normalizedDensity = minOf(1.0f, maxOf(0.0f, currentTextDensity * 5))
+        val adjustedDensity = normalizedDensity * adaptiveResponseStrength
+        val adjustmentFactor = 2.0f - adjustedDensity * 1.5f
+        val adaptiveSpeed = (baseScrollSpeed / adjustmentFactor).toLong()
+
+        val minSpeed = (500 * (1 / adaptiveResponseStrength)).toLong().coerceAtLeast(300)
+        val maxSpeed = (6000 * adaptiveResponseStrength).toLong().coerceAtMost(8000)
+
+        return minOf(maxSpeed, maxOf(minSpeed, adaptiveSpeed))
+    }
+
     private fun createSimpleOverlay() {
         try {
             windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-            // Create a proper custom overlay view
             overlayView = createModernOverlayView()
 
             layoutParams = WindowManager.LayoutParams(
@@ -116,7 +759,6 @@ class ScrollerOverlayService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT
             ).apply {
-                // Remove the gravity constraint to allow movement anywhere on screen
                 gravity = Gravity.TOP or Gravity.START
                 x = 100
                 y = 200
@@ -129,37 +771,25 @@ class ScrollerOverlayService : Service() {
                 override fun onTouch(view: View, event: MotionEvent): Boolean {
                     when (event.action) {
                         MotionEvent.ACTION_DOWN -> {
-                            // Save initial position
                             initialX = layoutParams!!.x
                             initialY = layoutParams!!.y
-
-                            // Save initial touch position
                             initialTouchX = event.rawX
                             initialTouchY = event.rawY
                             return true
                         }
                         MotionEvent.ACTION_MOVE -> {
-                            // Calculate how far we've moved
                             val dx = event.rawX - initialTouchX
                             val dy = event.rawY - initialTouchY
-
-                            // Update position
                             layoutParams!!.x = initialX + dx.toInt()
                             layoutParams!!.y = initialY + dy.toInt()
-
-                            // Update the view with new position
                             windowManager?.updateViewLayout(view, layoutParams)
                             return true
                         }
                         MotionEvent.ACTION_UP -> {
-                            // Store the final position
                             initialX = layoutParams!!.x
                             initialY = layoutParams!!.y
-
-                            // Only consider it a click if we didn't move the overlay
                             val moved = Math.abs(event.rawX - initialTouchX) > 5 ||
                                        Math.abs(event.rawY - initialTouchY) > 5
-
                             return moved
                         }
                     }
@@ -167,16 +797,13 @@ class ScrollerOverlayService : Service() {
                 }
             })
 
-            Log.d(TAG, "✅ Modern overlay created successfully")
-
+            Log.d(TAG, "✅ Overlay created successfully")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Failed to create overlay", e)
-            // Continue without overlay rather than crashing
         }
     }
 
     private fun createModernOverlayView(): View {
-        // Create the main container with rounded background
         val mainContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
@@ -184,30 +811,27 @@ class ScrollerOverlayService : Service() {
             elevation = 12f
         }
 
-        // Header with app icon, title, and minimize button
+        // Header
         val headerLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        // App icon (using a simple colored circle as icon)
         val iconView = View(this).apply {
-            background = createCircleBackground(0xFF6750A4.toInt()) // Material 3 primary color
+            background = createCircleBackground(0xFF6750A4.toInt())
             layoutParams = LinearLayout.LayoutParams(48, 48).apply {
                 setMargins(0, 0, 16, 0)
             }
         }
 
-        // Title text
         val titleText = TextView(this).apply {
             text = "🎌 Manga Scroller"
             textSize = 16f
-            setTextColor(0xFF1C1B1F.toInt()) // Material 3 on-surface
+            setTextColor(0xFF1C1B1F.toInt())
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        // Minimize button
         val minimizeButton = Button(this).apply {
             text = "➖"
             textSize = 12f
@@ -215,16 +839,14 @@ class ScrollerOverlayService : Service() {
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(16, 12, 16, 12)
             layoutParams = LinearLayout.LayoutParams(48, 48)
-            setOnClickListener {
-                toggleMinimizedView()
-            }
+            setOnClickListener { toggleMinimizedView() }
         }
 
         headerLayout.addView(iconView)
         headerLayout.addView(titleText)
         headerLayout.addView(minimizeButton)
 
-        // Status indicator
+        // Status layout
         val statusLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -250,7 +872,7 @@ class ScrollerOverlayService : Service() {
         statusLayout.addView(statusDot)
         statusLayout.addView(statusText)
 
-        // Main control buttons layout
+        // Button layout
         val buttonLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -258,11 +880,10 @@ class ScrollerOverlayService : Service() {
             tag = "buttonLayout"
         }
 
-        // Play/Pause button
         val playPauseButton = Button(this).apply {
             text = if (isScrolling) "⏸️ Pause" else "▶️ Play"
             textSize = 14f
-            background = createButtonBackground(0xFF6750A4.toInt()) // Primary color
+            background = createButtonBackground(0xFF6750A4.toInt())
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(32, 16, 32, 16)
             layoutParams = LinearLayout.LayoutParams(
@@ -282,39 +903,33 @@ class ScrollerOverlayService : Service() {
             }
         }
 
-        // Settings button
         val settingsButton = Button(this).apply {
             text = "⚙️"
             textSize = 16f
-            background = createButtonBackground(0xFF625B71.toInt()) // Secondary color
+            background = createButtonBackground(0xFF625B71.toInt())
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(20, 16, 20, 16)
             layoutParams = LinearLayout.LayoutParams(56, 56).apply {
                 setMargins(0, 0, 8, 0)
             }
-            setOnClickListener {
-                toggleExpandedView()
-            }
+            setOnClickListener { toggleExpandedView() }
         }
 
-        // Close button
         val closeButton = Button(this).apply {
             text = "✕"
             textSize = 14f
-            background = createButtonBackground(0xFFB3261E.toInt()) // Error color
+            background = createButtonBackground(0xFFB3261E.toInt())
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(20, 16, 20, 16)
             layoutParams = LinearLayout.LayoutParams(56, 56)
-            setOnClickListener {
-                stopSelf()
-            }
+            setOnClickListener { stopSelf() }
         }
 
         buttonLayout.addView(playPauseButton)
         buttonLayout.addView(settingsButton)
         buttonLayout.addView(closeButton)
 
-        // Expanded settings panel (initially hidden)
+        // Expanded layout (initially hidden)
         val expandedLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -322,22 +937,12 @@ class ScrollerOverlayService : Service() {
             tag = "expandedLayout"
         }
 
-        // Speed control section
-        val speedSection = createSpeedControlSection()
-
-        // Direction control section
-        val directionSection = createDirectionControlSection()
-
-        // Adaptive scrolling section
-        val adaptiveSection = createAdaptiveScrollingSection()
-
-        // Opacity control section
-        val opacitySection = createOpacityControlSection()
-
-        expandedLayout.addView(speedSection)
-        expandedLayout.addView(directionSection)
-        expandedLayout.addView(adaptiveSection)
-        expandedLayout.addView(opacitySection)
+        // Add sections
+        expandedLayout.addView(createSpeedControlSection())
+        expandedLayout.addView(createDirectionControlSection())
+        expandedLayout.addView(createAdaptiveScrollingSection())
+        expandedLayout.addView(createOCRStatusSection())
+        expandedLayout.addView(createOpacityControlSection())
 
         // Assemble the complete overlay
         mainContainer.addView(headerLayout)
@@ -387,6 +992,7 @@ class ScrollerOverlayService : Service() {
                 setOnClickListener {
                     baseScrollSpeed = speed
                     updateSpeedButtons()
+                    saveSettings()
                     Toast.makeText(this@ScrollerOverlayService, "Speed: $label", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -443,6 +1049,7 @@ class ScrollerOverlayService : Service() {
                 setOnClickListener {
                     currentDirection = direction
                     updateDirectionButtons()
+                    saveSettings()
                     val dirName = when (direction) {
                         ScrollerAccessibilityService.DIRECTION_UP -> "Up"
                         ScrollerAccessibilityService.DIRECTION_DOWN -> "Down"
@@ -475,7 +1082,6 @@ class ScrollerOverlayService : Service() {
             setPadding(0, 0, 0, 8)
         }
 
-        // Main switch to enable/disable adaptive scrolling
         val switchLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -494,41 +1100,11 @@ class ScrollerOverlayService : Service() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        // Declare these variables before they're used in the switch listener
-        val sensitivityLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = if (adaptiveScrollingEnabled) View.VISIBLE else View.GONE
-            setPadding(0, 8, 0, 8)
-        }
-
-        val responseLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = if (adaptiveScrollingEnabled) View.VISIBLE else View.GONE
-            setPadding(0, 8, 0, 0)
-        }
-
-        val sensitivityValueText = TextView(this).apply {
-            text = String.format("%.1fx", textDetectionSensitivity)
-            textSize = 11f
-            gravity = Gravity.END
-            setTextColor(0xFF49454F.toInt())
-        }
-
-        val responseValueText = TextView(this).apply {
-            text = String.format("%.1fx", adaptiveResponseStrength)
-            textSize = 11f
-            gravity = Gravity.END
-            setTextColor(0xFF49454F.toInt())
-        }
-
         val adaptiveSwitch = Switch(this).apply {
             isChecked = adaptiveScrollingEnabled
             setOnCheckedChangeListener { _, isChecked ->
                 adaptiveScrollingEnabled = isChecked
-                // Update visibility of sensitivity controls based on switch state
-                sensitivityLayout.visibility = if (isChecked) View.VISIBLE else View.GONE
-                responseLayout.visibility = if (isChecked) View.VISIBLE else View.GONE
-
+                saveSettings()
                 Toast.makeText(
                     this@ScrollerOverlayService,
                     if (isChecked) "Adaptive Scrolling: ON" else "Adaptive Scrolling: OFF",
@@ -540,83 +1116,79 @@ class ScrollerOverlayService : Service() {
         switchLayout.addView(switchLabel)
         switchLayout.addView(adaptiveSwitch)
 
-        // Text detection sensitivity control
-        val sensitivityLabel = TextView(this).apply {
-            text = "Text Detection Sensitivity"
-            textSize = 12f
-            setTextColor(0xFF49454F.toInt())
-        }
-
-        val sensitivitySlider = SeekBar(this).apply {
-            max = 100
-            progress = (textDetectionSensitivity * 50).toInt() // 0.5-2.0 mapped to 0-100
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    if (fromUser) {
-                        // Map 0-100 to 0.5-2.0 range
-                        textDetectionSensitivity = 0.5f + progress / 100f * 1.5f
-                        sensitivityValueText.text = String.format("%.1fx", textDetectionSensitivity)
-                    }
-                }
-
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                    Toast.makeText(
-                        this@ScrollerOverlayService,
-                        "Detection Sensitivity: ${String.format("%.1fx", textDetectionSensitivity)}",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            })
-        }
-
-        // Response strength control
-        val responseLabel = TextView(this).apply {
-            text = "Adaptation Strength"
-            textSize = 12f
-            setTextColor(0xFF49454F.toInt())
-        }
-
-        val responseSlider = SeekBar(this).apply {
-            max = 100
-            progress = (adaptiveResponseStrength * 50).toInt() // 0.5-2.0 mapped to 0-100
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    if (fromUser) {
-                        // Map 0-100 to 0.5-2.0 range
-                        adaptiveResponseStrength = 0.5f + progress / 100f * 1.5f
-                        responseValueText.text = String.format("%.1fx", adaptiveResponseStrength)
-                    }
-                }
-
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                    Toast.makeText(
-                        this@ScrollerOverlayService,
-                        "Adaptation Strength: ${String.format("%.1fx", adaptiveResponseStrength)}",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            })
-        }
-
-        // Add all components to main layout
         adaptiveLayout.addView(adaptiveLabel)
         adaptiveLayout.addView(switchLayout)
 
-        // Add sensitivity controls
-        sensitivityLayout.addView(sensitivityLabel)
-        sensitivityLayout.addView(sensitivitySlider)
-        sensitivityLayout.addView(sensitivityValueText)
-        adaptiveLayout.addView(sensitivityLayout)
-
-        // Add response controls
-        responseLayout.addView(responseLabel)
-        responseLayout.addView(responseSlider)
-        responseLayout.addView(responseValueText)
-        adaptiveLayout.addView(responseLayout)
-
         return adaptiveLayout
+    }
+
+    private fun createOCRStatusSection(): LinearLayout {
+        val ocrStatusLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 16)
+        }
+
+        val ocrStatusLabel = TextView(this).apply {
+            text = "🔍 OCR Status & Detection"
+            textSize = 13f
+            setTextColor(0xFF49454F.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 8)
+        }
+
+        val ocrStatusText = TextView(this).apply {
+            text = getOCRStatusInfo()
+            textSize = 11f
+            setTextColor(getOCRStatusColor())
+            tag = "ocrStatusText"
+            setPadding(0, 0, 0, 4)
+        }
+
+        val detectionMethodText = TextView(this).apply {
+            text = "Method: $detectionMethod"
+            textSize = 10f
+            setTextColor(0xFF6B7280.toInt())
+            tag = "detectionMethodText"
+            setPadding(0, 0, 0, 4)
+        }
+
+        val detectedTextLabel = TextView(this).apply {
+            text = "Last Detected:"
+            textSize = 10f
+            setTextColor(0xFF4B5563.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 4, 0, 2)
+        }
+
+        val detectedTextContent = TextView(this).apply {
+            text = lastDetectedText
+            textSize = 9f
+            setTextColor(0xFF6B7280.toInt())
+            tag = "detectedTextContent"
+            maxLines = 3
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(8, 0, 0, 0)
+        }
+
+        ocrStatusLayout.addView(ocrStatusLabel)
+        ocrStatusLayout.addView(ocrStatusText)
+        ocrStatusLayout.addView(detectionMethodText)
+        ocrStatusLayout.addView(detectedTextLabel)
+        ocrStatusLayout.addView(detectedTextContent)
+
+        return ocrStatusLayout
+    }
+
+    /**
+     * Get OCR status color based on current status
+     */
+    private fun getOCRStatusColor(): Int {
+        return when (ocrStatus) {
+            OCRStatus.READY, OCRStatus.PROCESSING -> 0xFF4CAF50.toInt() // Green
+            OCRStatus.INITIALIZING -> 0xFF2196F3.toInt() // Blue
+            OCRStatus.ERROR -> 0xFFFF5722.toInt() // Red
+            OCRStatus.STOPPED, OCRStatus.DISABLED -> 0xFF757575.toInt() // Gray
+        }
     }
 
     private fun createOpacityControlSection(): LinearLayout {
@@ -644,7 +1216,7 @@ class ScrollerOverlayService : Service() {
             val opacityButton = Button(this).apply {
                 text = label
                 textSize = 10f
-                tag = opacity  // Store opacity value as tag for later reference
+                tag = opacity
                 background = createButtonBackground(
                     if (overlayOpacity == opacity) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
                 )
@@ -731,15 +1303,11 @@ class ScrollerOverlayService : Service() {
         (overlayView as? LinearLayout)?.let { container ->
             findViewsByTag(container, "opacityButtons") { buttonsLayout ->
                 if (buttonsLayout is LinearLayout) {
-                    // Go through each button in the opacity buttons layout
                     for (i in 0 until buttonsLayout.childCount) {
                         val button = buttonsLayout.getChildAt(i) as? Button
                         if (button != null) {
-                            // Check if this button represents the current opacity
                             val buttonOpacity = button.tag as? Float
                             val isSelected = buttonOpacity == overlayOpacity
-
-                            // Update button appearance
                             button.background = createButtonBackground(
                                 if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
                             )
@@ -782,12 +1350,8 @@ class ScrollerOverlayService : Service() {
         scrollJob = coroutineScope.launch {
             while (isScrolling && isActive) {
                 try {
-                    // Perform scroll action via accessibility service
                     performScrollAction()
-
-                    // Wait for next scroll
                     delay(baseScrollSpeed)
-
                 } catch (e: Exception) {
                     Log.e(TAG, "Error during scrolling", e)
                     break
@@ -807,32 +1371,23 @@ class ScrollerOverlayService : Service() {
 
     private fun updateOverlayUI() {
         try {
-            // Update the modern overlay UI elements
             (overlayView as? LinearLayout)?.let { container ->
-                // Update status dot and text
                 for (i in 0 until container.childCount) {
                     val child = container.getChildAt(i)
                     if (child is LinearLayout && child.childCount >= 2) {
-                        // Check if this is the status layout
                         val secondChild = child.getChildAt(1)
                         if (secondChild is TextView && (secondChild.text == "Active" || secondChild.text == "Paused")) {
-                            // Update status dot
                             val statusDot = child.getChildAt(0) as View
                             statusDot.background = createCircleBackground(
                                 if (isScrolling) 0xFF4CAF50.toInt() else 0xFFFF9800.toInt()
                             )
-                            // Update status text
                             secondChild.text = if (isScrolling) "Active" else "Paused"
                             secondChild.setTextColor(if (isScrolling) 0xFF4CAF50.toInt() else 0xFFFF9800.toInt())
                         }
 
-                        // Check if this is the button layout
                         if (child.childCount >= 3 && child.getChildAt(0) is Button) {
                             val playPauseButton = child.getChildAt(0) as Button
-                            // Update button text
                             playPauseButton.text = if (isScrolling) "⏸️ Pause" else "▶️ Play"
-
-                            // Update button background to indicate active state
                             playPauseButton.background = createButtonBackground(
                                 if (isScrolling) 0xFF4CAF50.toInt() else 0xFF6750A4.toInt()
                             )
@@ -840,24 +1395,19 @@ class ScrollerOverlayService : Service() {
                     }
                 }
 
-                // Also update speed and direction buttons to reflect current settings
                 updateSpeedButtons()
                 updateDirectionButtons()
             }
 
-            // Update notification
             startForeground(NOTIFICATION_ID, createNotification())
-
         } catch (e: Exception) {
             Log.w(TAG, "Could not update overlay UI", e)
         }
     }
 
     private fun performScrollAction() {
-        // Get the accessibility service to perform the scroll
         val accessibilityService = ScrollerAccessibilityService.getInstance()
         if (accessibilityService != null) {
-            // If adaptive scrolling is enabled, analyze screen and adjust speed
             if (adaptiveScrollingEnabled) {
                 val currentTime = System.currentTimeMillis()
                 if (currentTime - lastTextAnalysisTime > textAnalysisInterval) {
@@ -865,211 +1415,14 @@ class ScrollerOverlayService : Service() {
                     lastTextAnalysisTime = currentTime
                 }
 
-                // Calculate adjusted scroll speed based on text density
                 val adjustedSpeed = calculateAdaptiveScrollSpeed()
-
-                // Log for debugging
-                Log.d(TAG, "Adaptive scroll: density=$currentTextDensity, speed=$adjustedSpeed")
-
                 accessibilityService.performScroll(currentDirection, adjustedSpeed)
             } else {
-                // Use base speed if adaptive scrolling is disabled
                 accessibilityService.performScroll(currentDirection, baseScrollSpeed)
             }
         } else {
             Log.w(TAG, "⚠️ Accessibility service not available")
         }
-    }
-
-    /**
-     * Analyzes the current screen to determine text density
-     */
-    private fun analyzeScreenForTextDensity() {
-        try {
-            // Capture screenshot if permission available (requires API 21+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                val displayMetrics = resources.displayMetrics
-                val width = displayMetrics.widthPixels
-                val height = displayMetrics.heightPixels
-
-                // Get a screenshot of the current screen (simplified approach)
-                val bitmap = captureScreenshot() ?: return
-
-                // Calculate text density (simplified algorithm)
-                val textDensity = calculateTextDensityFromBitmap(bitmap)
-
-                // Update text density history
-                textDensityHistory.add(textDensity)
-                if (textDensityHistory.size > 5) {
-                    textDensityHistory.removeAt(0)
-                }
-
-                // Calculate average text density
-                averageTextDensity = textDensityHistory.average().toFloat()
-                currentTextDensity = textDensity
-
-                // Clean up
-                bitmap.recycle()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error analyzing screen for text density", e)
-        }
-    }
-
-    /**
-     * Calculate text density from bitmap image with improved detection
-     */
-    private fun calculateTextDensityFromBitmap(bitmap: android.graphics.Bitmap): Float {
-        // Enhanced algorithm for text detection that uses more sophisticated pattern recognition
-        val width = bitmap.width
-        val height = bitmap.height
-
-        // Adjusted for sensitivity settings
-        val threshold = 128 - ((textDetectionSensitivity - 1.0f) * 40).toInt() // Range: 88-168
-        val samplingRate = (11 - textDetectionSensitivity * 5).toInt().coerceAtLeast(1) // Higher sensitivity = more samples
-
-        Log.d(TAG, "Text detection with threshold: $threshold, sampling rate: $samplingRate")
-
-        var darkPixels = 0
-        var sampledPixels = 0
-
-        // Sample pixels based on sensitivity settings
-        for (x in 0 until width step samplingRate) {
-            for (y in 0 until height step samplingRate) {
-                sampledPixels++
-                val pixel = bitmap.getPixel(x, y)
-
-                // Advanced brightness calculation with emphasis on text vs background
-                val r = android.graphics.Color.red(pixel)
-                val g = android.graphics.Color.green(pixel)
-                val b = android.graphics.Color.blue(pixel)
-
-                // Use more sophisticated brightness formula that better detects text
-                // Text often has high contrast with background
-                val brightness = (r * 0.299 + g * 0.587 + b * 0.114).toInt()
-
-                // Detect text-like contrast patterns
-                if (brightness < threshold) {
-                    darkPixels++
-                }
-
-                // Look for edges (common in text) by comparing neighboring pixels
-                if (x < width - samplingRate && y < height - samplingRate) {
-                    val pixelRight = bitmap.getPixel(x + samplingRate, y)
-                    val pixelDown = bitmap.getPixel(x, y + samplingRate)
-
-                    val brightRight = (android.graphics.Color.red(pixelRight) * 0.299 +
-                            android.graphics.Color.green(pixelRight) * 0.587 +
-                            android.graphics.Color.blue(pixelRight) * 0.114).toInt()
-
-                    val brightDown = (android.graphics.Color.red(pixelDown) * 0.299 +
-                            android.graphics.Color.green(pixelDown) * 0.587 +
-                            android.graphics.Color.blue(pixelDown) * 0.114).toInt()
-
-                    // Detect contrast edges (common in text)
-                    if (Math.abs(brightness - brightRight) > 40 || Math.abs(brightness - brightDown) > 40) {
-                        darkPixels++
-                    }
-                }
-            }
-        }
-
-        // Apply text detection sensitivity multiplier to the final result
-        val baseDensity = darkPixels.toFloat() / sampledPixels.coerceAtLeast(1)
-        return baseDensity * textDetectionSensitivity
-    }
-
-    /**
-     * Enhanced simulated screenshot with text-like patterns
-     */
-    private fun captureScreenshot(): android.graphics.Bitmap? {
-        try {
-            // This is a simplified implementation
-            // In a real implementation, you'd need to use MediaProjection API which requires user permission
-            val displayMetrics = resources.displayMetrics
-            val width = displayMetrics.widthPixels
-            val height = displayMetrics.heightPixels
-
-            return android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888).apply {
-                // Create a more sophisticated simulated content with text-like patterns
-                val canvas = android.graphics.Canvas(this)
-                val paint = android.graphics.Paint().apply {
-                    color = android.graphics.Color.BLACK
-                    textSize = 24f
-                    isAntiAlias = true
-                }
-
-                val random = java.util.Random()
-
-                // Create text-like regions (simulating manga panels and text bubbles)
-                val numPanels = random.nextInt(4) + 2
-                for (i in 0 until numPanels) {
-                    val panelX = random.nextInt(width - 200)
-                    val panelY = random.nextInt(height - 200)
-                    val panelWidth = random.nextInt(200) + 100
-                    val panelHeight = random.nextInt(200) + 100
-
-                    // Simulate text lines in a panel
-                    val numLines = random.nextInt(6) + 1
-                    for (line in 0 until numLines) {
-                        val lineY = panelY + (line + 1) * panelHeight / (numLines + 1)
-                        val lineWidth = random.nextInt(panelWidth - 20) + 20
-                        canvas.drawLine(
-                            panelX + 10f,
-                            lineY.toFloat(),
-                            (panelX + 10 + lineWidth).toFloat(),
-                            lineY.toFloat(),
-                            paint
-                        )
-                    }
-                }
-
-                // Add some random "characters" for more realism
-                for (i in 0 until 30) {
-                    val x = random.nextInt(width)
-                    val y = random.nextInt(height)
-                    canvas.drawText("漫画", x.toFloat(), y.toFloat(), paint)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error creating simulated screenshot", e)
-            return null
-        }
-    }
-
-    /**
-     * Calculate adaptive scroll speed based on text density and user-defined response strength
-     */
-    private fun calculateAdaptiveScrollSpeed(): Long {
-        // Higher text density = slower scroll
-        // Lower text density = faster scroll
-
-        // Normalize text density to a value between 0.0 and 1.0
-        val normalizedDensity = minOf(1.0f, maxOf(0.0f, currentTextDensity * 5))
-
-        // Apply the response strength modifier to the normalized density
-        // Higher response strength = stronger effect on scroll speed
-        val adjustedDensity = normalizedDensity * adaptiveResponseStrength
-
-        // Calculate adjustment factor (0.5 to 2.0)
-        // Higher density = lower factor (slower scroll)
-        val adjustmentFactor = 2.0f - adjustedDensity * 1.5f
-
-        // Apply adjustment to base speed
-        val adaptiveSpeed = (baseScrollSpeed / adjustmentFactor).toLong()
-
-        // Log the details for debugging
-        Log.d(TAG, "Adaptive scrolling: density=$currentTextDensity, " +
-                  "adjusted=$adjustedDensity, " +
-                  "factor=$adjustmentFactor, " +
-                  "speed=$adaptiveSpeed")
-
-        // Ensure speed stays within reasonable bounds
-        // The range varies based on response strength
-        val minSpeed = (500 * (1 / adaptiveResponseStrength)).toLong().coerceAtLeast(300)
-        val maxSpeed = (6000 * adaptiveResponseStrength).toLong().coerceAtMost(8000)
-
-        return minOf(maxSpeed, maxOf(minSpeed, adaptiveSpeed))
     }
 
     private fun createNotificationChannel() {
@@ -1123,44 +1476,117 @@ class ScrollerOverlayService : Service() {
         )
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        Log.d(TAG, "🛑 Service destroying...")
+    /**
+     * Update OCR status and handle logging/UI feedback
+     */
+    private fun updateOCRStatus(newStatus: OCRStatus) {
+        val previousStatus = ocrStatus
+        ocrStatus = newStatus
 
+        // Log status change with detailed information
+        when (newStatus) {
+            OCRStatus.DISABLED -> {
+                Log.i(TAG, "🔴 OCR Status: DISABLED")
+            }
+            OCRStatus.INITIALIZING -> {
+                Log.i(TAG, "🟡 OCR Status: INITIALIZING - Setting up MediaProjection and ImageReader")
+            }
+            OCRStatus.READY -> {
+                val setupTime = System.currentTimeMillis() - ocrStartTime
+                Log.i(TAG, "🟢 OCR Status: READY - Setup completed in ${setupTime}ms")
+            }
+            OCRStatus.PROCESSING -> {
+                Log.d(TAG, "🔵 OCR Status: PROCESSING - Analyzing screen content")
+            }
+            OCRStatus.ERROR -> {
+                val errorMsg = lastOCRError ?: "Unknown error"
+                Log.e(TAG, "🔴 OCR Status: ERROR - $errorMsg")
+            }
+            OCRStatus.STOPPED -> {
+                Log.i(TAG, "⏹️ OCR Status: STOPPED - OCR capture halted")
+            }
+        }
+
+        // Update overlay UI if needed
+        if (previousStatus != newStatus) {
+            updateOCRStatusInUI()
+        }
+    }
+
+    /**
+     * Get current OCR status information
+     */
+    fun getOCRStatusInfo(): String {
+        return when (ocrStatus) {
+            OCRStatus.DISABLED -> "OCR: Disabled"
+            OCRStatus.INITIALIZING -> "OCR: Starting..."
+            OCRStatus.READY -> "OCR: Ready (${getOCRSuccessRate()}% success)"
+            OCRStatus.PROCESSING -> "OCR: Processing..."
+            OCRStatus.ERROR -> "OCR: Error - ${lastOCRError}"
+            OCRStatus.STOPPED -> "OCR: Stopped"
+        }
+    }
+
+    /**
+     * Calculate OCR success rate
+     */
+    private fun getOCRSuccessRate(): Int {
+        val totalAttempts = ocrSuccessCount + ocrFailureCount
+        return if (totalAttempts > 0) {
+            ((ocrSuccessCount.toFloat() / totalAttempts) * 100).toInt()
+        } else {
+            0
+        }
+    }
+
+    /**
+     * Get OCR runtime information
+     */
+    fun getOCRRuntimeInfo(): String {
+        if (ocrStatus == OCRStatus.DISABLED) return "OCR not active"
+
+        val runtime = System.currentTimeMillis() - ocrStartTime
+        val runtimeSeconds = runtime / 1000
+        val lastProcessSeconds = (System.currentTimeMillis() - lastOCRProcessTime) / 1000
+
+        return "Runtime: ${runtimeSeconds}s | Last process: ${lastProcessSeconds}s ago | Success: $ocrSuccessCount | Errors: $ocrFailureCount"
+    }
+
+    /**
+     * Update OCR status display in overlay UI
+     */
+    private fun updateOCRStatusInUI() {
         try {
-            stopScrolling()
-            overlayView?.let { windowManager?.removeView(it) }
-            coroutineScope.cancel()
+            // Find and update OCR status in the overlay if it exists
+            (overlayView as? LinearLayout)?.let { container ->
+                findViewsByTag(container, "ocrStatusText") { view ->
+                    if (view is TextView) {
+                        view.text = getOCRStatusInfo()
+                        // Update color based on status
+                        val color = when (ocrStatus) {
+                            OCRStatus.READY, OCRStatus.PROCESSING -> 0xFF4CAF50.toInt() // Green
+                            OCRStatus.INITIALIZING -> 0xFF2196F3.toInt() // Blue
+                            OCRStatus.ERROR -> 0xFFFF5722.toInt() // Red
+                            OCRStatus.STOPPED, OCRStatus.DISABLED -> 0xFF757575.toInt() // Gray
+                        }
+                        view.setTextColor(color)
+                    }
+                }
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Error during service destruction", e)
-        }
-
-        Log.d(TAG, "✅ Service destroyed successfully")
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun createRoundedBackground(): android.graphics.drawable.GradientDrawable {
-        return android.graphics.drawable.GradientDrawable().apply {
-            shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-            cornerRadius = 32f
-            setColor(0xFFF7F2FA.toInt()) // Material 3 surface
-            setStroke(2, 0xFFE7E0EC.toInt()) // Material 3 outline
+            Log.w(TAG, "Could not update OCR status in UI", e)
         }
     }
 
-    private fun createCircleBackground(color: Int): android.graphics.drawable.GradientDrawable {
-        return android.graphics.drawable.GradientDrawable().apply {
-            shape = android.graphics.drawable.GradientDrawable.OVAL
-            setColor(color)
-        }
-    }
-
-    private fun createButtonBackground(color: Int): android.graphics.drawable.GradientDrawable {
-        return android.graphics.drawable.GradientDrawable().apply {
-            shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-            cornerRadius = 20f
-            setColor(color)
-        }
+    /**
+     * Enum class for OCR status tracking
+     */
+    private enum class OCRStatus {
+        INITIALIZING,
+        READY,
+        PROCESSING,
+        ERROR,
+        STOPPED,
+        DISABLED
     }
 }

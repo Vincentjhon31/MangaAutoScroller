@@ -20,7 +20,8 @@ fun SettingsDialog(
     ocrEnabled: Boolean,
     onOcrEnabledChange: (Boolean) -> Unit,
     overlayOpacity: Float,
-    onOverlayOpacityChange: (Float) -> Unit
+    onOverlayOpacityChange: (Float) -> Unit,
+    onReset: () -> Unit = {}
 ) {
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -153,19 +154,34 @@ fun SettingsDialog(
                 // Action Buttons
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    TextButton(onClick = onDismiss) {
-                        Text("Cancel")
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Button(
+                    // Reset button on the left
+                    OutlinedButton(
                         onClick = {
-                            // Settings are automatically saved via state
-                            onDismiss()
-                        }
+                            onReset()
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        )
                     ) {
-                        Text("Save Settings")
+                        Text("Reset Defaults")
+                    }
+
+                    // Save and Cancel on the right
+                    Row {
+                        TextButton(onClick = onDismiss) {
+                            Text("Cancel")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                // Settings are automatically saved via state
+                                onDismiss()
+                            }
+                        ) {
+                            Text("Save")
+                        }
                     }
                 }
             }

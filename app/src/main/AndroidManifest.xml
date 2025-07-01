@@ -10,6 +10,7 @@
     <!-- Essential permissions only -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
@@ -40,7 +41,7 @@
             android:name=".service.ScrollerOverlayService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="mediaProjection" />
 
         <!-- Main Accessibility Service for scrolling -->
         <service
