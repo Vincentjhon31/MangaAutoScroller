@@ -21,6 +21,8 @@ fun SettingsDialog(
     onOcrEnabledChange: (Boolean) -> Unit,
     overlayOpacity: Float,
     onOverlayOpacityChange: (Float) -> Unit,
+    mlDetectionEnabled: Boolean = false,
+    onMlDetectionEnabledChange: (Boolean) -> Unit = {},
     onReset: () -> Unit = {}
 ) {
     Dialog(onDismissRequest = onDismiss) {
@@ -114,6 +116,32 @@ fun SettingsDialog(
                     Switch(
                         checked = ocrEnabled,
                         onCheckedChange = onOcrEnabledChange
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // ML Bubble Detection Section (Advanced)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "🤖 ML Bubble Detection",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Uses manga-trained AI to detect speech bubbles. Requires screen capture permission (same as Smart OCR). Best for adaptive scrolling.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                        )
+                    }
+                    Switch(
+                        checked = mlDetectionEnabled,
+                        onCheckedChange = onMlDetectionEnabledChange
                     )
                 }
 
