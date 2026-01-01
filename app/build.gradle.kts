@@ -91,6 +91,9 @@ dependencies {
 
     // For screen capture
     implementation("androidx.activity:activity-ktx:1.8.2")
+    
+    // Fragment KTX - Required for registerForActivityResult
+    implementation("androidx.fragment:fragment-ktx:1.6.2")
 
     // Add Gson for JSON serialization
     implementation("com.google.code.gson:gson:2.10.1")
