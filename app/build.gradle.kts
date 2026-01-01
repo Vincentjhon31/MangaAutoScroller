@@ -23,6 +23,16 @@ android {
         buildConfigField("String", "RELEASE_URL", "\"https://github.com/Vincentjhon31/MangaAutoScroller/releases/latest\"")
     }
 
+    signingConfigs {
+        create("release") {
+            // Use debug keystore for now - works for personal releases
+            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+    
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -30,6 +40,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {
