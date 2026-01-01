@@ -23,6 +23,10 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.zynt.mangaautoscroller.MainActivity
 import com.zynt.mangaautoscroller.R
+import com.zynt.mangaautoscroller.ml.BubbleDetector
+import com.zynt.mangaautoscroller.ml.BubbleDetectorConfig
+import com.zynt.mangaautoscroller.ml.ModelManager
+import com.zynt.mangaautoscroller.ml.ModelStatus
 import kotlinx.coroutines.*
 import android.content.pm.ServiceInfo
 
@@ -42,11 +46,11 @@ class ScrollerOverlayService : Service() {
     private var currentTextDensity = 0.0f
 
     // Touch parameters for dragging
-    private var initialX = 0
-    private var initialY = 0
-    private var initialTouchX = 0f
-    private var initialTouchY = 0f
     private var layoutParams: WindowManager.LayoutParams? = null
+    private var initialX: Int = 0
+    private var initialY: Int = 0
+    private var initialTouchX: Float = 0f
+    private var initialTouchY: Float = 0f
 
     // Adaptive scrolling parameters
     private var adaptiveScrollingEnabled = true
@@ -67,6 +71,15 @@ class ScrollerOverlayService : Service() {
     private var overlayOpacity = 0.85f
     private var isExpanded = false
 
+    // Panel detection and smart pause variables
+    private var panelDetectionEnabled = true
+    private var lastDetectedPanels = mutableListOf<android.graphics.Rect>()
+    private var smartPauseStrength = 1.0f // 0.0-2.0, default 1.0
+    private var lastScrollAdjustmentTime = 0L
+    private var currentScrollSpeed = baseScrollSpeed
+    private var scrollStartTime = 0L
+    private var imageComplexity = 0.5f // Default medium complexity
+
     // SharedPreferences key constants
     companion object {
         private const val NOTIFICATION_ID = 1337
@@ -81,6 +94,16 @@ class ScrollerOverlayService : Service() {
         private const val KEY_ADAPTIVE_ENABLED = "adaptive_enabled"
         private const val KEY_SENSITIVITY = "text_sensitivity"
         private const val KEY_RESPONSE_STRENGTH = "response_strength"
+
+        // New preference keys for comic type features
+        private const val KEY_COMIC_TYPE = "comic_type"
+        private const val KEY_SCROLL_DISTANCE = "scroll_distance"
+        private const val KEY_READING_SPEED = "reading_speed"
+        private const val KEY_AUTO_PAUSE_ENABLED = "auto_pause_enabled"
+        private const val KEY_PANEL_DETECTION_ENABLED = "panel_detection_enabled"
+        private const val KEY_SMART_PAUSE_STRENGTH = "smart_pause_strength"
+        private const val KEY_USER_ADJUSTMENTS = "user_adjustments"
+        private const val KEY_ML_DETECTION_ENABLED = "ml_detection_enabled"
     }
 
     // OCR and MediaProjection variables
@@ -106,6 +129,27 @@ class ScrollerOverlayService : Service() {
     private var lastDetectedText = "No text detected yet"
     private var detectionMethod = "None"
 
+    // Comic type and scroll configuration
+    private var comicType = "MANGA" // Default to manga
+    private var scrollDistance = "MEDIUM" // Default to medium scroll distance
+    private var readingSpeed = "NORMAL" // Default to normal reading speed
+    private var autoPauseEnabled = true // Default to enabled
+
+    // ML-based bubble detection (advanced detection mode)
+    private var mlDetectionEnabled = false // Use ONNX bubble detector instead of ML Kit
+    private var modelManager: ModelManager? = null
+    private var lastBubbleCount = 0
+    private var lastBubbleCoverage = 0f
+    private var mlModelStatus = ModelStatus.NOT_LOADED
+
+    // Register a MediaProjection callback - required starting with Android 12
+    private val mediaProjectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.d(TAG, "MediaProjection stopped")
+            stopOCRCapture()
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service created")
@@ -113,6 +157,37 @@ class ScrollerOverlayService : Service() {
 
         // Load saved settings when service is created
         loadSavedSettings()
+
+        // Initialize ML Model Manager for bubble detection
+        initializeMLDetection()
+    }
+
+    /**
+     * Initialize ML-based bubble detection if enabled
+     */
+    private fun initializeMLDetection() {
+        if (mlDetectionEnabled) {
+            try {
+                modelManager = ModelManager.getInstance(this)
+                modelManager?.addStatusListener { status ->
+                    mlModelStatus = status
+                    Log.d(TAG, "ML Model status: $status")
+                }
+                // Preload model in background with TURBO config for maximum speed
+                // Using TURBO config: CPU-only (faster than NNAPI), higher threshold (0.25)
+                modelManager?.initializeAsync(BubbleDetectorConfig.TURBO) { success ->
+                    if (success) {
+                        Log.i(TAG, "✅ ML Bubble Detector ready (TURBO mode - CPU optimized)")
+                    } else {
+                        Log.w(TAG, "⚠️ ML Bubble Detector failed to initialize")
+                    }
+                }
+                Log.d(TAG, "ML Detection initialized")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to initialize ML detection", e)
+                mlDetectionEnabled = false
+            }
+        }
     }
 
     // Add methods to save and load settings
@@ -139,7 +214,20 @@ class ScrollerOverlayService : Service() {
             textDetectionSensitivity = prefs.getFloat(KEY_SENSITIVITY, 1.0f)
             adaptiveResponseStrength = prefs.getFloat(KEY_RESPONSE_STRENGTH, 1.0f)
 
-            Log.d(TAG, "Settings loaded: speed=$baseScrollSpeed, direction=$currentDirection")
+            // Load comic type settings
+            comicType = prefs.getString(KEY_COMIC_TYPE, "MANGA") ?: "MANGA"
+            scrollDistance = prefs.getString(KEY_SCROLL_DISTANCE, "MEDIUM") ?: "MEDIUM"
+            readingSpeed = prefs.getString(KEY_READING_SPEED, "NORMAL") ?: "NORMAL"
+            autoPauseEnabled = prefs.getBoolean(KEY_AUTO_PAUSE_ENABLED, true)
+
+            // Load panel detection settings
+            panelDetectionEnabled = prefs.getBoolean(KEY_PANEL_DETECTION_ENABLED, true)
+            smartPauseStrength = prefs.getFloat(KEY_SMART_PAUSE_STRENGTH, 1.0f)
+
+            // Load ML detection setting
+            mlDetectionEnabled = prefs.getBoolean(KEY_ML_DETECTION_ENABLED, false)
+
+            Log.d(TAG, "Settings loaded: speed=$baseScrollSpeed, direction=$currentDirection, comicType=$comicType, mlDetection=$mlDetectionEnabled")
         } catch (e: Exception) {
             Log.e(TAG, "Error loading settings", e)
             // If loading fails, we'll use the default values
@@ -159,10 +247,23 @@ class ScrollerOverlayService : Service() {
             editor.putFloat(KEY_SENSITIVITY, textDetectionSensitivity)
             editor.putFloat(KEY_RESPONSE_STRENGTH, adaptiveResponseStrength)
 
+            // Save comic type settings
+            editor.putString(KEY_COMIC_TYPE, comicType)
+            editor.putString(KEY_SCROLL_DISTANCE, scrollDistance)
+            editor.putString(KEY_READING_SPEED, readingSpeed)
+            editor.putBoolean(KEY_AUTO_PAUSE_ENABLED, autoPauseEnabled)
+
+            // Save panel detection settings
+            editor.putBoolean(KEY_PANEL_DETECTION_ENABLED, panelDetectionEnabled)
+            editor.putFloat(KEY_SMART_PAUSE_STRENGTH, smartPauseStrength)
+
+            // Save ML detection setting
+            editor.putBoolean(KEY_ML_DETECTION_ENABLED, mlDetectionEnabled)
+
             // Apply changes
             editor.apply()
 
-            Log.d(TAG, "Settings saved: speed=$baseScrollSpeed, direction=$currentDirection")
+            Log.d(TAG, "Settings saved: speed=$baseScrollSpeed, direction=$currentDirection, comicType=$comicType, mlDetection=$mlDetectionEnabled")
         } catch (e: Exception) {
             Log.e(TAG, "Error saving settings", e)
         }
@@ -188,14 +289,27 @@ class ScrollerOverlayService : Service() {
         }
 
         try {
-            // Start foreground service with correct type for media projection FIRST
-            // This must happen before any MediaProjection operations
+            // Check if we have MediaProjection data for OCR or ML detection
+            val hasMediaProjection = intent?.hasExtra("media_projection_data") == true
+            val ocrRequested = intent?.getBooleanExtra("ocr_enabled", false) == true
+            val mlRequested = intent?.getBooleanExtra("ml_detection_enabled", false) == true
+            val needsScreenCapture = (ocrRequested || mlRequested) && hasMediaProjection
+
+            // Start foreground service with correct type
+            // Use MEDIA_PROJECTION when screen capture is needed (OCR or ML detection)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val serviceType = if (needsScreenCapture) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                } else {
+                    // Use SPECIAL_USE for basic mode (just overlay + accessibility scrolling)
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                }
+
                 ServiceCompat.startForeground(
                     this,
                     NOTIFICATION_ID,
                     createNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    serviceType
                 )
             } else {
                 startForeground(NOTIFICATION_ID, createNotification())
@@ -209,6 +323,12 @@ class ScrollerOverlayService : Service() {
                 textDetectionSensitivity = serviceIntent.getFloatExtra("text_sensitivity", 1.0f)
                 adaptiveResponseStrength = serviceIntent.getFloatExtra("response_strength", 1.0f)
                 ocrEnabled = serviceIntent.getBooleanExtra("ocr_enabled", false)
+                mlDetectionEnabled = serviceIntent.getBooleanExtra("ml_detection_enabled", false)
+
+                // Initialize ML detection if enabled
+                if (mlDetectionEnabled && modelManager == null) {
+                    initializeMLDetection()
+                }
 
                 // Setup OCR if enabled and MediaProjection data is available
                 val mediaProjectionData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -218,11 +338,15 @@ class ScrollerOverlayService : Service() {
                     serviceIntent.getParcelableExtra("media_projection_data")
                 }
 
-                if (ocrEnabled && mediaProjectionData != null) {
-                    setupOCRCapture(mediaProjectionData)
-                    Log.d(TAG, "✅ OCR capture setup completed")
+                // Setup screen capture if EITHER OCR or ML detection is enabled
+                val needsScreenCapture = ocrEnabled || mlDetectionEnabled
+                if (needsScreenCapture && mediaProjectionData != null) {
+                    setupScreenCapture(mediaProjectionData)
+                    Log.d(TAG, "✅ Screen capture setup completed (OCR=$ocrEnabled, ML=$mlDetectionEnabled)")
+                } else if (needsScreenCapture) {
+                    Log.w(TAG, "⚠️ Screen capture requested but MediaProjection data not available")
                 } else {
-                    Log.i(TAG, "OCR not enabled or MediaProjection data not available")
+                    Log.i(TAG, "Screen capture not needed (OCR and ML detection disabled)")
                 }
             }
 
@@ -242,9 +366,10 @@ class ScrollerOverlayService : Service() {
     }
 
     /**
-     * Setup OCR screen capture using MediaProjection
+     * Setup screen capture using MediaProjection
+     * Used for both OCR (ML Kit) and ML Bubble Detection (ONNX)
      */
-    private fun setupOCRCapture(mediaProjectionData: Intent) {
+    private fun setupScreenCapture(mediaProjectionData: Intent) {
         try {
             updateOCRStatus(OCRStatus.INITIALIZING)
             ocrStartTime = System.currentTimeMillis()
@@ -270,16 +395,11 @@ class ScrollerOverlayService : Service() {
 
             // Register a MediaProjection callback - required starting with Android 12
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                    override fun onStop() {
-                        Log.d(TAG, "MediaProjection stopped")
-                        stopOCRCapture()
-                    }
-                }, Handler(Looper.getMainLooper()))
+                mediaProjection?.registerCallback(mediaProjectionCallback, Handler(Looper.getMainLooper()))
             }
             // Create VirtualDisplay
             virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "MangaOCRCapture",
+                "MangaScreenCapture",
                 screenWidth,
                 screenHeight,
                 screenDensity,
@@ -289,11 +409,11 @@ class ScrollerOverlayService : Service() {
                 null
             )
 
-            // Start periodic OCR capture
-            startOCRCaptureLoop()
+            // Start periodic screen capture loop
+            startScreenCaptureLoop()
             updateOCRStatus(OCRStatus.READY)
 
-            Log.d(TAG, "OCR capture setup completed: ${screenWidth}x${screenHeight} @ ${screenDensity}dpi")
+            Log.d(TAG, "Screen capture setup completed: ${screenWidth}x${screenHeight} @ ${screenDensity}dpi")
         } catch (e: Exception) {
             Log.e(TAG, "Error setting up OCR capture", e)
             lastOCRError = e.message
@@ -303,18 +423,20 @@ class ScrollerOverlayService : Service() {
     }
 
     /**
-     * Start the OCR capture loop
+     * Start the screen capture loop for OCR and/or ML detection
      */
-    private fun startOCRCaptureLoop() {
+    private fun startScreenCaptureLoop() {
         ocrCaptureJob = coroutineScope.launch {
-            while (ocrEnabled && isActive && virtualDisplay != null) {
+            // Run while EITHER OCR or ML detection is enabled
+            val screenCaptureEnabled = { ocrEnabled || mlDetectionEnabled }
+            while (screenCaptureEnabled() && isActive && virtualDisplay != null) {
                 try {
                     delay(textAnalysisInterval) // Wait between captures
                     if (adaptiveScrollingEnabled && isScrolling) {
                         captureAndProcessScreen()
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error in OCR capture loop", e)
+                    Log.e(TAG, "Error in screen capture loop", e)
                     break
                 }
             }
@@ -322,7 +444,7 @@ class ScrollerOverlayService : Service() {
     }
 
     /**
-     * Capture screen and process with ML Kit OCR
+     * Capture screen and process with ML Kit OCR or ML Bubble Detection
      */
     private fun captureAndProcessScreen() {
         try {
@@ -332,11 +454,105 @@ class ScrollerOverlayService : Service() {
                 image.close()
 
                 bitmap?.let { bmp ->
-                    processImageWithMLKit(bmp)
+                    // Use ML bubble detection if enabled and model is ready
+                    if (mlDetectionEnabled && mlModelStatus == ModelStatus.READY) {
+                        Log.d(TAG, "🔍 Processing screen with ML Bubble Detector...")
+                        processImageWithBubbleDetector(bmp)
+                    } else if (ocrEnabled) {
+                        // Use ML Kit OCR when OCR is enabled
+                        Log.d(TAG, "🔍 Processing screen with ML Kit OCR...")
+                        processImageWithMLKit(bmp)
+                    } else {
+                        // Neither detection method is ready/enabled
+                        Log.w(TAG, "No detection method available (ML: $mlDetectionEnabled, status: $mlModelStatus, OCR: $ocrEnabled)")
+                        bmp.recycle()
+                    }
                 }
+            } else {
+                Log.v(TAG, "No image available from ImageReader")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error capturing and processing screen", e)
+        }
+    }
+
+    /**
+     * Process bitmap with ML-based Bubble Detector (ONNX model)
+     * This provides more accurate manga-specific text detection.
+     */
+    private fun processImageWithBubbleDetector(bitmap: Bitmap) {
+        coroutineScope.launch {
+            try {
+                updateOCRStatus(OCRStatus.PROCESSING)
+                lastOCRProcessTime = System.currentTimeMillis()
+                detectionMethod = "ML Bubble Detector"
+
+                // First, analyze image complexity for multi-signal analysis
+                imageComplexity = com.zynt.mangaautoscroller.PanelDetector.calculateImageComplexity(bitmap)
+
+                // Detect panel boundaries if enabled
+                if (panelDetectionEnabled) {
+                    lastDetectedPanels = com.zynt.mangaautoscroller.PanelDetector.detectPanels(bitmap, screenWidth, screenHeight).toMutableList()
+                    adjustScrollingForPanels(lastDetectedPanels)
+                }
+
+                // Run bubble detection
+                val result = modelManager?.detectBubbles(bitmap)
+
+                if (result != null && result.hasDetections) {
+                    ocrSuccessCount++
+                    updateOCRStatus(OCRStatus.READY)
+
+                    // Update bubble detection stats
+                    lastBubbleCount = result.bubbleCount
+                    lastBubbleCoverage = result.totalCoverageArea
+
+                    // Use bubble detection for text density
+                    val textDensity = result.textDensityScore * textDetectionSensitivity
+
+                    // Update text density history
+                    textDensityHistory.add(textDensity)
+                    if (textDensityHistory.size > 5) {
+                        textDensityHistory.removeAt(0)
+                    }
+                    averageTextDensity = textDensityHistory.average().toFloat()
+                    currentTextDensity = textDensity
+
+                    // Update display text
+                    lastDetectedText = "Detected ${result.bubbleCount} speech bubbles (${(result.totalCoverageArea * 100).toInt()}% coverage)"
+
+                    Log.d(TAG, "Bubble Detection: ${result.bubbleCount} bubbles, density=$textDensity, time=${result.inferenceTimeMs}ms")
+
+                    // Check for dialogue-heavy or action panels
+                    if (result.isDialogueHeavy) {
+                        Log.i(TAG, "Dialogue-heavy panel detected - using slower scroll")
+                    } else if (result.isActionPanel) {
+                        Log.i(TAG, "Action panel detected - using faster scroll")
+                    }
+                } else {
+                    // No detections - treat as action panel
+                    lastBubbleCount = 0
+                    lastBubbleCoverage = 0f
+                    currentTextDensity = 0.1f // Low density for action panels
+                    lastDetectedText = "No speech bubbles detected"
+                    updateOCRStatus(OCRStatus.READY)
+                }
+
+                // Clean up bitmap
+                bitmap.recycle()
+
+            } catch (e: Exception) {
+                ocrFailureCount++
+                lastOCRError = e.message
+                updateOCRStatus(OCRStatus.ERROR)
+                Log.e(TAG, "Error in bubble detection", e)
+                bitmap.recycle()
+
+                // Fallback to ML Kit on error
+                if (!bitmap.isRecycled) {
+                    processImageWithMLKit(bitmap)
+                }
+            }
         }
     }
 
@@ -380,6 +596,16 @@ class ScrollerOverlayService : Service() {
             updateOCRStatus(OCRStatus.PROCESSING)
             lastOCRProcessTime = System.currentTimeMillis()
 
+            // First, analyze image complexity for multi-signal analysis
+            imageComplexity = com.zynt.mangaautoscroller.PanelDetector.calculateImageComplexity(bitmap)
+
+            // Detect panel boundaries if enabled
+            if (panelDetectionEnabled) {
+                lastDetectedPanels = com.zynt.mangaautoscroller.PanelDetector.detectPanels(bitmap, screenWidth, screenHeight).toMutableList()
+                // Adjust scrolling based on panel boundaries
+                adjustScrollingForPanels(lastDetectedPanels)
+            }
+
             val inputImage = InputImage.fromBitmap(bitmap, 0)
             recognizer.process(inputImage)
                 .addOnSuccessListener { visionText ->
@@ -393,6 +619,11 @@ class ScrollerOverlayService : Service() {
 
                     Log.d(TAG, "OCR Success: Found ${textBlocks.size} text blocks")
                     Log.v(TAG, "Extracted text: $extractedText")
+
+                    // Save the last detected text for display
+                    if (extractedText.isNotEmpty()) {
+                        lastDetectedText = extractedText.take(200) + if (extractedText.length > 200) "..." else ""
+                    }
 
                     // Analyze the text for adaptive scrolling
                     analyzeOCRResults(extractedText, textBlocks)
@@ -542,18 +773,58 @@ class ScrollerOverlayService : Service() {
      */
     private fun stopOCRCapture() {
         try {
-            ocrCaptureJob?.cancel()
-            virtualDisplay?.release()
-            mediaProjection?.stop()
-            imageReader?.close()
+            Log.d(TAG, "Stopping OCR capture and cleaning up resources...")
 
-            virtualDisplay = null
-            mediaProjection = null
-            imageReader = null
+            // Cancel all OCR-related coroutine jobs
+            ocrCaptureJob?.cancel()
+
+            // Clean up the ImageReader before the VirtualDisplay
+            try {
+                imageReader?.setOnImageAvailableListener(null, null)
+                imageReader?.close()
+                imageReader = null
+                Log.d(TAG, "ImageReader closed")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing ImageReader", e)
+            }
+
+            // Release the virtual display
+            try {
+                virtualDisplay?.release()
+                virtualDisplay = null
+                Log.d(TAG, "VirtualDisplay released")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error releasing VirtualDisplay", e)
+            }
+
+            // Stop the media projection last
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    try {
+                        mediaProjection?.unregisterCallback(mediaProjectionCallback)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error unregistering callback", e)
+                        // Continue with cleanup regardless of this error
+                    }
+                }
+                mediaProjection?.stop()
+                mediaProjection = null
+                Log.d(TAG, "MediaProjection stopped")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping MediaProjection", e)
+            }
+
+            // Reset OCR status and flags if applicable
+            updateOCRStatus(OCRStatus.DISABLED)
+            ocrEnabled = false
 
             Log.d(TAG, "OCR capture stopped and resources cleaned up")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping OCR capture", e)
+            // Even if we hit an error, ensure these are nullified
+            virtualDisplay = null
+            mediaProjection = null
+            imageReader = null
         }
     }
 
@@ -566,6 +837,10 @@ class ScrollerOverlayService : Service() {
             stopOCRCapture()
             overlayView?.let { windowManager?.removeView(it) }
             coroutineScope.cancel()
+
+            // Release ML model resources
+            modelManager?.release()
+            modelManager = null
         } catch (e: Exception) {
             Log.e(TAG, "Error during service destruction", e)
         }
@@ -733,9 +1008,49 @@ class ScrollerOverlayService : Service() {
     }
 
     /**
-     * Calculate adaptive scroll speed based on text density
+     * Calculate adaptive scroll speed based on text density and bubble detection.
+     * 
+     * Speed logic (delay between scrolls):
+     * - More text/bubbles = LONGER delay (slower scrolling, more reading time)
+     * - Less text/bubbles = SHORTER delay (faster scrolling through action)
+     * 
+     * @return Delay in milliseconds between scroll actions
      */
     private fun calculateAdaptiveScrollSpeed(): Long {
+        // If ML detection is active and has valid data, use bubble-based calculation
+        if (mlDetectionEnabled && mlModelStatus == ModelStatus.READY && lastBubbleCount >= 0) {
+            // Calculate based on bubble detection results
+            val bubbleFactor = when {
+                lastBubbleCount >= 5 -> 2.5f   // Many bubbles: scroll 2.5x slower (more delay)
+                lastBubbleCount >= 3 -> 1.8f   // Several bubbles: 1.8x slower
+                lastBubbleCount >= 1 -> 1.3f   // Few bubbles: 1.3x slower
+                else -> 0.7f                    // No bubbles (action): 0.7x faster (less delay)
+            }
+            
+            // Also factor in bubble coverage area
+            val coverageFactor = when {
+                lastBubbleCoverage > 0.3f -> 2.0f   // Very text-heavy: much slower
+                lastBubbleCoverage > 0.15f -> 1.5f  // Moderate text: slower
+                lastBubbleCoverage > 0.05f -> 1.1f  // Some text: slightly slower
+                else -> 0.8f                         // Little/no text: faster
+            }
+            
+            // Combine factors (weighted average)
+            val combinedFactor = (bubbleFactor * 0.6f + coverageFactor * 0.4f)
+            
+            // Apply response strength - how much to trust/amplify the detection
+            val adjustedFactor = 1f + (combinedFactor - 1f) * adaptiveResponseStrength
+            
+            val adaptiveSpeed = (baseScrollSpeed * adjustedFactor).toLong()
+            
+            // Clamp to reasonable bounds
+            val minSpeed = 300L  // Minimum delay (fastest scrolling)
+            val maxSpeed = 5000L // Maximum delay (slowest scrolling)
+            
+            return adaptiveSpeed.coerceIn(minSpeed, maxSpeed)
+        }
+        
+        // Fallback: Original text density-based calculation
         val normalizedDensity = minOf(1.0f, maxOf(0.0f, currentTextDensity * 5))
         val adjustedDensity = normalizedDensity * adaptiveResponseStrength
         val adjustmentFactor = 2.0f - adjustedDensity * 1.5f
@@ -752,54 +1067,44 @@ class ScrollerOverlayService : Service() {
             windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
             overlayView = createModernOverlayView()
 
-            layoutParams = WindowManager.LayoutParams(
+            val layoutParams = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                else
+                    WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,  // Removed FLAG_NOT_TOUCHABLE.inv() and FLAG_LAYOUT_NO_LIMITS
                 PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                x = 100
-                y = 200
-            }
+            )
 
+            // Important: Set a fixed position for the overlay
+            layoutParams.gravity = Gravity.TOP or Gravity.START
+            layoutParams.x = 100  // Set initial X position
+            layoutParams.y = 200  // Set initial Y position
+            this.layoutParams = layoutParams
+
+            // First add the view with full opacity
+            overlayView?.alpha = 1.0f
+
+            // Add view to window manager
             windowManager?.addView(overlayView, layoutParams)
 
-            // Add touch listener for drag functionality
-            overlayView?.setOnTouchListener(object : View.OnTouchListener {
-                override fun onTouch(view: View, event: MotionEvent): Boolean {
-                    when (event.action) {
-                        MotionEvent.ACTION_DOWN -> {
-                            initialX = layoutParams!!.x
-                            initialY = layoutParams!!.y
-                            initialTouchX = event.rawX
-                            initialTouchY = event.rawY
-                            return true
-                        }
-                        MotionEvent.ACTION_MOVE -> {
-                            val dx = event.rawX - initialTouchX
-                            val dy = event.rawY - initialTouchY
-                            layoutParams!!.x = initialX + dx.toInt()
-                            layoutParams!!.y = initialY + dy.toInt()
-                            windowManager?.updateViewLayout(view, layoutParams)
-                            return true
-                        }
-                        MotionEvent.ACTION_UP -> {
-                            initialX = layoutParams!!.x
-                            initialY = layoutParams!!.y
-                            val moved = Math.abs(event.rawX - initialTouchX) > 5 ||
-                                       Math.abs(event.rawY - initialTouchY) > 5
-                            return moved
-                        }
-                    }
-                    return false
-                }
-            })
+            // Then set the desired opacity after adding
+            overlayView?.alpha = overlayOpacity
 
-            Log.d(TAG, "✅ Overlay created successfully")
+            // Setup touch listener for manual repositioning
+            setupDragToMove()
+
+            // Update UI elements
+            updateAllButtons()
+
+            Log.d(TAG, "Overlay created successfully")
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to create overlay", e)
+            Log.e(TAG, "Error creating overlay", e)
+            Toast.makeText(this, "Error creating overlay: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -838,7 +1143,7 @@ class ScrollerOverlayService : Service() {
             background = createButtonBackground(0xFF79747E.toInt())
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(16, 12, 16, 12)
-            layoutParams = LinearLayout.LayoutParams(48, 48)
+            layoutParams = LinearLayout.LayoutParams(64, 64)
             setOnClickListener { toggleMinimizedView() }
         }
 
@@ -869,8 +1174,19 @@ class ScrollerOverlayService : Service() {
             tag = "statusText"
         }
 
+        // Add comic type indicator
+        val comicTypeIndicator = TextView(this).apply {
+            text = getComicTypeEmoji()
+            textSize = 14f
+            setTextColor(0xFF1C1B1F.toInt())
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            tag = "comicTypeIndicator"
+        }
+
         statusLayout.addView(statusDot)
         statusLayout.addView(statusText)
+        statusLayout.addView(comicTypeIndicator)
 
         // Button layout
         val buttonLayout = LinearLayout(this).apply {
@@ -881,7 +1197,7 @@ class ScrollerOverlayService : Service() {
         }
 
         val playPauseButton = Button(this).apply {
-            text = if (isScrolling) "⏸️ Pause" else "▶️ Play"
+            text = if (isScrolling) "⏸️" else "▶️"
             textSize = 14f
             background = createButtonBackground(0xFF6750A4.toInt())
             setTextColor(0xFFFFFFFF.toInt())
@@ -908,8 +1224,11 @@ class ScrollerOverlayService : Service() {
             textSize = 16f
             background = createButtonBackground(0xFF625B71.toInt())
             setTextColor(0xFFFFFFFF.toInt())
-            setPadding(20, 16, 20, 16)
-            layoutParams = LinearLayout.LayoutParams(56, 56).apply {
+            setPadding(32, 16, 32, 16)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
                 setMargins(0, 0, 8, 0)
             }
             setOnClickListener { toggleExpandedView() }
@@ -920,8 +1239,13 @@ class ScrollerOverlayService : Service() {
             textSize = 14f
             background = createButtonBackground(0xFFB3261E.toInt())
             setTextColor(0xFFFFFFFF.toInt())
-            setPadding(20, 16, 20, 16)
-            layoutParams = LinearLayout.LayoutParams(56, 56)
+            setPadding(32, 16, 32, 16)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, 0, 8, 0)
+            }
             setOnClickListener { stopSelf() }
         }
 
@@ -938,9 +1262,13 @@ class ScrollerOverlayService : Service() {
         }
 
         // Add sections
+        expandedLayout.addView(createComicTypeSection())  // Add the new comic type section
+        expandedLayout.addView(createScrollDistanceSection())  // Add scroll distance section
+        expandedLayout.addView(createReadingSpeedSection())  // Add reading speed section
         expandedLayout.addView(createSpeedControlSection())
         expandedLayout.addView(createDirectionControlSection())
         expandedLayout.addView(createAdaptiveScrollingSection())
+        expandedLayout.addView(createAutoPauseSection())  // Add auto-pause section
         expandedLayout.addView(createOCRStatusSection())
         expandedLayout.addView(createOpacityControlSection())
 
@@ -951,6 +1279,214 @@ class ScrollerOverlayService : Service() {
         mainContainer.addView(expandedLayout)
 
         return mainContainer
+    }
+
+    private fun createComicTypeSection(): LinearLayout {
+        val comicTypeLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 16)
+        }
+
+        val comicTypeLabel = TextView(this).apply {
+            text = "📚 Comic Type"
+            textSize = 13f
+            setTextColor(0xFF49454F.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 8)
+        }
+
+        val comicTypeButtonsLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            tag = "comicTypeButtons"
+        }
+
+        val comicTypes = listOf("Manga" to "MANGA", "Manhwa" to "MANHWA", "Manhua" to "MANHUA")
+        comicTypes.forEach { (label, type) ->
+            val comicTypeButton = Button(this).apply {
+                text = label
+                textSize = 11f
+                background = createButtonBackground(
+                    if (comicType == type) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                )
+                setTextColor(0xFFFFFFFF.toInt())
+                setPadding(12, 8, 12, 8)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(3, 0, 3, 0)
+                }
+                setOnClickListener {
+                    comicType = type
+                    updateComicTypeButtons()
+                    saveSettings()
+                    Toast.makeText(this@ScrollerOverlayService, "Comic Type: $label", Toast.LENGTH_SHORT).show()
+                }
+            }
+            comicTypeButtonsLayout.addView(comicTypeButton)
+        }
+
+        comicTypeLayout.addView(comicTypeLabel)
+        comicTypeLayout.addView(comicTypeButtonsLayout)
+        return comicTypeLayout
+    }
+
+    private fun createScrollDistanceSection(): LinearLayout {
+        val distanceLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 16)
+        }
+
+        val distanceLabel = TextView(this).apply {
+            text = "📏 Scroll Length"
+            textSize = 13f
+            setTextColor(0xFF49454F.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 8)
+        }
+
+        val distanceButtonsLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            tag = "distanceButtons"
+        }
+
+        val distances = listOf("Short" to "SHORT", "Medium" to "MEDIUM", "Long" to "LONG")
+        distances.forEach { (label, distance) ->
+            val distanceButton = Button(this).apply {
+                text = label
+                textSize = 11f
+                background = createButtonBackground(
+                    if (scrollDistance == distance) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                )
+                setTextColor(0xFFFFFFFF.toInt())
+                setPadding(12, 8, 12, 8)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(3, 0, 3, 0)
+                }
+                setOnClickListener {
+                    scrollDistance = distance
+                    updateScrollDistanceButtons()
+                    applyScrollDistanceToSpeed()
+                    saveSettings()
+                    Toast.makeText(this@ScrollerOverlayService, "Scroll Distance: $label", Toast.LENGTH_SHORT).show()
+                }
+            }
+            distanceButtonsLayout.addView(distanceButton)
+        }
+
+        distanceLayout.addView(distanceLabel)
+        distanceLayout.addView(distanceButtonsLayout)
+        return distanceLayout
+    }
+
+    private fun createReadingSpeedSection(): LinearLayout {
+        val speedLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 16)
+        }
+
+        val speedLabel = TextView(this).apply {
+            text = "⏱️ Reading Speed"
+            textSize = 13f
+            setTextColor(0xFF49454F.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 8)
+        }
+
+        val speedButtonsLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            tag = "readingSpeedButtons"
+        }
+
+        val speeds = listOf("Slow" to "SLOW", "Normal" to "NORMAL", "Fast" to "FAST")
+        speeds.forEach { (label, speed) ->
+            val speedButton = Button(this).apply {
+                text = label
+                textSize = 11f
+                background = createButtonBackground(
+                    if (readingSpeed == speed) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                )
+                setTextColor(0xFFFFFFFF.toInt())
+                setPadding(12, 8, 12, 8)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(3, 0, 3, 0)
+                }
+                setOnClickListener {
+                    readingSpeed = speed
+                    updateReadingSpeedButtons()
+                    saveSettings()
+                    Toast.makeText(this@ScrollerOverlayService, "Reading Speed: $label", Toast.LENGTH_SHORT).show()
+                }
+            }
+            speedButtonsLayout.addView(speedButton)
+        }
+
+        speedLayout.addView(speedLabel)
+        speedLayout.addView(speedButtonsLayout)
+        return speedLayout
+    }
+
+    private fun createAutoPauseSection(): LinearLayout {
+        val autoPauseLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 16)
+        }
+
+        val autoPauseLabel = TextView(this).apply {
+            text = "⏸️ Auto Pause"
+            textSize = 13f
+            setTextColor(0xFF49454F.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 8)
+        }
+
+        val switchLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, 0, 0, 8)
+            }
+        }
+
+        val switchLabel = TextView(this).apply {
+            text = "Enabled"
+            textSize = 12f
+            setTextColor(0xFF49454F.toInt())
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val autoPauseSwitch = Switch(this).apply {
+            isChecked = autoPauseEnabled
+            setOnCheckedChangeListener { _, isChecked ->
+                autoPauseEnabled = isChecked
+                saveSettings()
+                Toast.makeText(
+                    this@ScrollerOverlayService,
+                    if (isChecked) "Auto Pause: ON" else "Auto Pause: OFF",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+
+        switchLayout.addView(switchLabel)
+        switchLayout.addView(autoPauseSwitch)
+
+        autoPauseLayout.addView(autoPauseLabel)
+        autoPauseLayout.addView(switchLayout)
+
+        return autoPauseLayout
     }
 
     private fun createSpeedControlSection(): LinearLayout {
@@ -1144,21 +1680,21 @@ class ScrollerOverlayService : Service() {
             setPadding(0, 0, 0, 4)
         }
 
-        val detectionMethodText = TextView(this).apply {
-            text = "Method: $detectionMethod"
-            textSize = 10f
-            setTextColor(0xFF6B7280.toInt())
-            tag = "detectionMethodText"
-            setPadding(0, 0, 0, 4)
-        }
+//        val detectionMethodText = TextView(this).apply {
+//            text = "Method: $detectionMethod"
+//            textSize = 10f
+//            setTextColor(0xFF6B7280.toInt())
+//            tag = "detectionMethodText"
+//            setPadding(0, 0, 0, 4)
+//        }
 
-        val detectedTextLabel = TextView(this).apply {
-            text = "Last Detected:"
-            textSize = 10f
-            setTextColor(0xFF4B5563.toInt())
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setPadding(0, 4, 0, 2)
-        }
+//        val detectedTextLabel = TextView(this).apply {
+//            text = "Last Detected:"
+//            textSize = 10f
+//            setTextColor(0xFF4B5563.toInt())
+//            typeface = android.graphics.Typeface.DEFAULT_BOLD
+//            setPadding(0, 4, 0, 2)
+//        }
 
         val detectedTextContent = TextView(this).apply {
             text = lastDetectedText
@@ -1172,8 +1708,8 @@ class ScrollerOverlayService : Service() {
 
         ocrStatusLayout.addView(ocrStatusLabel)
         ocrStatusLayout.addView(ocrStatusText)
-        ocrStatusLayout.addView(detectionMethodText)
-        ocrStatusLayout.addView(detectedTextLabel)
+//        ocrStatusLayout.addView(detectionMethodText)
+//        ocrStatusLayout.addView(detectedTextLabel)
         ocrStatusLayout.addView(detectedTextContent)
 
         return ocrStatusLayout
@@ -1242,6 +1778,98 @@ class ScrollerOverlayService : Service() {
         return opacityLayout
     }
 
+    /**
+     * Adjust scrolling behavior when approaching panel boundaries
+     * @param panels List of panel boundary rectangles
+     */
+    private fun adjustScrollingForPanels(panels: List<android.graphics.Rect>) {
+        // If no panels or feature disabled, exit early
+        if (!panelDetectionEnabled || panels.isEmpty() || System.currentTimeMillis() - lastScrollAdjustmentTime < 500) {
+            return
+        }
+
+        try {
+            // Get current scroll position (estimated based on time since scrolling started)
+            val currentY = if (scrollStartTime > 0) {
+                ((System.currentTimeMillis() - scrollStartTime) * baseScrollSpeed / 1000) % screenHeight
+            } else {
+                screenHeight / 2 // Default to middle if we don't have a start time
+            }
+
+            // Check if we're approaching any panel boundary
+            var nearestBoundaryDistance = Int.MAX_VALUE
+
+            for (panel in panels) {
+                // Check distance to this panel's bottom
+                val distanceToBottom = if (currentDirection == ScrollerAccessibilityService.DIRECTION_DOWN) {
+                    panel.bottom - currentY.toInt()
+                } else if (currentDirection == ScrollerAccessibilityService.DIRECTION_UP) {
+                    currentY.toInt() - panel.top
+                } else if (currentDirection == ScrollerAccessibilityService.DIRECTION_RIGHT) {
+                    panel.right - currentY.toInt()
+                } else {
+                    currentY.toInt() - panel.left
+                }
+
+                // Only consider panels ahead of our current position within a certain range
+                if (distanceToBottom in 1..screenHeight/3) {
+                    nearestBoundaryDistance = minOf(nearestBoundaryDistance, distanceToBottom)
+                }
+            }
+
+            // If we're approaching a boundary, adjust the scroll speed
+            if (nearestBoundaryDistance < Int.MAX_VALUE) {
+                // Calculate adjustment factor - more slowing as we get closer
+                val proximityFactor = 1 - (nearestBoundaryDistance / (screenHeight/3.0f))
+                val adjustmentStrength = smartPauseStrength * proximityFactor
+
+                // Adjust scroll speed to slow down
+                val adjustedSpeed = (baseScrollSpeed * (1 - (0.8 * adjustmentStrength))).toLong()
+
+                // Apply the adjustment if it's significantly different from current speed
+                if (Math.abs(adjustedSpeed - currentScrollSpeed) > baseScrollSpeed * 0.1) {
+                    currentScrollSpeed = adjustedSpeed
+                    // Record this adjustment for learning
+                    recordUserAdjustment("AUTO_PANEL", currentScrollSpeed)
+                    lastScrollAdjustmentTime = System.currentTimeMillis()
+                    Log.d(TAG, "Panel boundary approaching: slowing to ${currentScrollSpeed}ms (${100 * adjustedSpeed / baseScrollSpeed}%)")
+                }
+
+                // If very close to boundary and auto-pause enabled, consider a brief pause
+                if (nearestBoundaryDistance < 20 && autoPauseEnabled) {
+                    // Brief pause
+                    Log.d(TAG, "Panel boundary reached: pausing briefly")
+                    temporarilyPauseScrolling(300) // Pause for 300ms
+                }
+            } else {
+                // Reset to base speed if not near any boundary
+                if (currentScrollSpeed != baseScrollSpeed) {
+                    currentScrollSpeed = baseScrollSpeed
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adjusting for panels", e)
+        }
+    }
+
+    /**
+     * Temporarily pause scrolling for a specified duration
+     */
+    private fun temporarilyPauseScrolling(pauseDuration: Long) {
+        val wasScrolling = isScrolling
+
+        if (wasScrolling) {
+            stopScrolling()
+
+            // Resume after the specified duration
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (wasScrolling) {
+                    startScrolling()
+                }
+            }, pauseDuration)
+        }
+    }
+
     private fun toggleMinimizedView() {
         isMinimized = !isMinimized
         (overlayView as? LinearLayout)?.let { container ->
@@ -1263,18 +1891,23 @@ class ScrollerOverlayService : Service() {
 
     private fun updateSpeedButtons() {
         (overlayView as? LinearLayout)?.let { container ->
-            findViewsByTag(container, "speedButtons") { view ->
-                if (view is Button) {
-                    val isSelected = when (view.text) {
-                        "0.5x" -> baseScrollSpeed == 4000L
-                        "1x" -> baseScrollSpeed == 2000L
-                        "2x" -> baseScrollSpeed == 1000L
-                        "3x" -> baseScrollSpeed == 666L
-                        else -> false
+            findViewsByTag(container, "speedButtons") { buttonsLayout ->
+                if (buttonsLayout is LinearLayout) {
+                    for (i in 0 until buttonsLayout.childCount) {
+                        val button = buttonsLayout.getChildAt(i) as? Button
+                        if (button != null) {
+                            val isSelected = when (button.text) {
+                                "0.5x" -> baseScrollSpeed == 4000L
+                                "1x" -> baseScrollSpeed == 2000L
+                                "2x" -> baseScrollSpeed == 1000L
+                                "3x" -> baseScrollSpeed == 666L
+                                else -> false
+                            }
+                            button.background = createButtonBackground(
+                                if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                            )
+                        }
                     }
-                    view.background = createButtonBackground(
-                        if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
-                    )
                 }
             }
         }
@@ -1282,18 +1915,23 @@ class ScrollerOverlayService : Service() {
 
     private fun updateDirectionButtons() {
         (overlayView as? LinearLayout)?.let { container ->
-            findViewsByTag(container, "directionButtons") { view ->
-                if (view is Button) {
-                    val isSelected = when (view.text) {
-                        "⬆️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_UP
-                        "⬇️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_DOWN
-                        "⬅️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_LEFT
-                        "➡️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_RIGHT
-                        else -> false
+            findViewsByTag(container, "directionButtons") { buttonsLayout ->
+                if (buttonsLayout is LinearLayout) {
+                    for (i in 0 until buttonsLayout.childCount) {
+                        val button = buttonsLayout.getChildAt(i) as? Button
+                        if (button != null) {
+                            val isSelected = when (button.text) {
+                                "⬆️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_UP
+                                "⬇️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_DOWN
+                                "⬅️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_LEFT
+                                "➡️" -> currentDirection == ScrollerAccessibilityService.DIRECTION_RIGHT
+                                else -> false
+                            }
+                            button.background = createButtonBackground(
+                                if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                            )
+                        }
                     }
-                    view.background = createButtonBackground(
-                        if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
-                    )
                 }
             }
         }
@@ -1318,16 +1956,101 @@ class ScrollerOverlayService : Service() {
         }
     }
 
-    private fun findViewsByTag(parent: ViewGroup, tag: String, action: (View) -> Unit) {
-        for (i in 0 until parent.childCount) {
-            val child = parent.getChildAt(i)
-            if (child.tag == tag) {
-                action(child)
+    /**
+     * Update the comic type buttons in the UI
+     */
+    private fun updateComicTypeButtons() {
+        (overlayView as? LinearLayout)?.let { container ->
+            findViewsByTag(container, "comicTypeButtons") { buttonsLayout ->
+                if (buttonsLayout is LinearLayout) {
+                    for (i in 0 until buttonsLayout.childCount) {
+                        val button = buttonsLayout.getChildAt(i) as? Button
+                        if (button != null) {
+                            val isSelected = when (button.text) {
+                                "Manga" -> comicType == "MANGA"
+                                "Manhwa" -> comicType == "MANHWA"
+                                "Manhua" -> comicType == "MANHUA"
+                                else -> false
+                            }
+                            button.background = createButtonBackground(
+                                if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                            )
+                        }
+                    }
+                }
             }
-            if (child is ViewGroup) {
-                findViewsByTag(child, tag, action)
+
+            // Update the comic type indicator in the status bar
+            findViewsByTag(container, "comicTypeIndicator") { view ->
+                if (view is TextView) {
+                    view.text = getComicTypeEmoji()
+                }
             }
         }
+    }
+
+    /**
+     * Update the scroll distance buttons in the UI
+     */
+    private fun updateScrollDistanceButtons() {
+        (overlayView as? LinearLayout)?.let { container ->
+            findViewsByTag(container, "distanceButtons") { buttonsLayout ->
+                if (buttonsLayout is LinearLayout) {
+                    for (i in 0 until buttonsLayout.childCount) {
+                        val button = buttonsLayout.getChildAt(i) as? Button
+                        if (button != null) {
+                            val isSelected = when (button.text) {
+                                "Short" -> scrollDistance == "SHORT"
+                                "Medium" -> scrollDistance == "MEDIUM"
+                                "Long" -> scrollDistance == "LONG"
+                                else -> false
+                            }
+                            button.background = createButtonBackground(
+                                if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Update the reading speed buttons in the UI
+     */
+    private fun updateReadingSpeedButtons() {
+        (overlayView as? LinearLayout)?.let { container ->
+            findViewsByTag(container, "readingSpeedButtons") { buttonsLayout ->
+                if (buttonsLayout is LinearLayout) {
+                    for (i in 0 until buttonsLayout.childCount) {
+                        val button = buttonsLayout.getChildAt(i) as? Button
+                        if (button != null) {
+                            val isSelected = when (button.text) {
+                                "Slow" -> readingSpeed == "SLOW"
+                                "Normal" -> readingSpeed == "NORMAL"
+                                "Fast" -> readingSpeed == "FAST"
+                                else -> false
+                            }
+                            button.background = createButtonBackground(
+                                if (isSelected) 0xFF6750A4.toInt() else 0xFF79747E.toInt()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Update overlay UI with all current settings
+     */
+    private fun updateAllButtons() {
+        updateComicTypeButtons()
+        updateScrollDistanceButtons()
+        updateReadingSpeedButtons()
+        updateSpeedButtons()
+        updateDirectionButtons()
+        updateOpacityButtons()
     }
 
     private fun toggleExpandedView() {
@@ -1345,13 +2068,19 @@ class ScrollerOverlayService : Service() {
 
     private fun startScrolling() {
         isScrolling = true
+        scrollStartTime = System.currentTimeMillis()
         updateOverlayUI()
 
         scrollJob = coroutineScope.launch {
             while (isScrolling && isActive) {
                 try {
                     performScrollAction()
-                    delay(baseScrollSpeed)
+                    // Use currentScrollSpeed for delay instead of baseScrollSpeed
+                    delay(currentScrollSpeed)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // Job was cancelled (user stopped scrolling) - this is expected, not an error
+                    Log.d(TAG, "Scroll job cancelled")
+                    break
                 } catch (e: Exception) {
                     Log.e(TAG, "Error during scrolling", e)
                     break
@@ -1387,7 +2116,7 @@ class ScrollerOverlayService : Service() {
 
                         if (child.childCount >= 3 && child.getChildAt(0) is Button) {
                             val playPauseButton = child.getChildAt(0) as Button
-                            playPauseButton.text = if (isScrolling) "⏸️ Pause" else "▶️ Play"
+                            playPauseButton.text = if (isScrolling) "⏸️" else "▶️"
                             playPauseButton.background = createButtonBackground(
                                 if (isScrolling) 0xFF4CAF50.toInt() else 0xFF6750A4.toInt()
                             )
@@ -1415,14 +2144,104 @@ class ScrollerOverlayService : Service() {
                     lastTextAnalysisTime = currentTime
                 }
 
+                // Calculate adaptive scroll speed based on text density/bubble detection
                 val adjustedSpeed = calculateAdaptiveScrollSpeed()
-                accessibilityService.performScroll(currentDirection, adjustedSpeed)
+                
+                // IMPORTANT: Actually apply the adjusted speed to the scroll loop delay
+                currentScrollSpeed = adjustedSpeed
+
+                // Calculate ADAPTIVE scroll distance based on text density from ML detection
+                // More text = shorter scrolls to give reading time
+                // Less text (action panels) = longer scrolls to move through faster
+                val baseDistance = when(scrollDistance) {
+                    "SHORT" -> 200
+                    "MEDIUM" -> 400
+                    "LONG" -> 600
+                    else -> 400
+                }
+                
+                val scrollPixels = calculateAdaptiveScrollDistance(baseDistance)
+
+                // Log adaptive behavior for debugging
+                if (mlDetectionEnabled && lastBubbleCount > 0) {
+                    Log.d(TAG, "📜 Adaptive scroll: speed=${adjustedSpeed}ms, distance=${scrollPixels}px, bubbles=$lastBubbleCount, density=${"%.2f".format(currentTextDensity)}")
+                }
+
+                // Use the new method that incorporates distance
+                accessibilityService.performScrollWithDistance(currentDirection, scrollPixels)
             } else {
-                accessibilityService.performScroll(currentDirection, baseScrollSpeed)
+                // Non-adaptive mode: use base settings
+                currentScrollSpeed = baseScrollSpeed
+                
+                // Calculate scroll distance based on the selected option
+                val scrollPixels = when(scrollDistance) {
+                    "SHORT" -> 200
+                    "MEDIUM" -> 400
+                    "LONG" -> 600
+                    else -> 400
+                }
+
+                // Use the new method that incorporates distance
+                accessibilityService.performScrollWithDistance(currentDirection, scrollPixels)
             }
         } else {
             Log.w(TAG, "⚠️ Accessibility service not available")
         }
+    }
+    
+    /**
+     * Calculate adaptive scroll distance based on detected text/bubbles.
+     * 
+     * The idea: 
+     * - Text-heavy panels (dialogue): scroll LESS distance, gives more reading time
+     * - Action panels (no text): scroll MORE distance, moves through faster
+     * - This mimics how a human would naturally read - pausing on text, skimming action
+     * 
+     * @param baseDistance The user's preferred base scroll distance
+     * @return Adjusted scroll distance in pixels
+     */
+    private fun calculateAdaptiveScrollDistance(baseDistance: Int): Int {
+        // If ML detection is providing bubble data, use that
+        if (mlDetectionEnabled && mlModelStatus == ModelStatus.READY) {
+            // Use bubble coverage to determine scroll behavior
+            // High coverage (lots of speech bubbles) = shorter scroll
+            // Low coverage (action panels) = longer scroll
+            
+            val coverageFactor = when {
+                lastBubbleCoverage > 0.3f -> 0.5f   // Very text-heavy: scroll 50% of base
+                lastBubbleCoverage > 0.15f -> 0.7f  // Moderate text: scroll 70% of base
+                lastBubbleCoverage > 0.05f -> 0.9f  // Some text: scroll 90% of base
+                else -> 1.2f                         // Action panel: scroll 120% of base
+            }
+            
+            // Also consider bubble count
+            val bubbleCountFactor = when {
+                lastBubbleCount >= 5 -> 0.6f   // Many bubbles: slow down significantly
+                lastBubbleCount >= 3 -> 0.8f   // Several bubbles: slow down moderately
+                lastBubbleCount >= 1 -> 0.95f  // Few bubbles: slight slowdown
+                else -> 1.1f                    // No bubbles: speed up slightly
+            }
+            
+            // Combine factors with response strength
+            val combinedFactor = (coverageFactor * 0.6f + bubbleCountFactor * 0.4f)
+            val adjustedFactor = 1f + (combinedFactor - 1f) * adaptiveResponseStrength
+            
+            val adjustedDistance = (baseDistance * adjustedFactor).toInt()
+            
+            // Clamp to reasonable bounds
+            return adjustedDistance.coerceIn(100, 800)
+        }
+        
+        // Fallback: use text density from basic analysis
+        val densityFactor = when {
+            currentTextDensity > 0.3f -> 0.6f   // High text density: shorter scroll
+            currentTextDensity > 0.2f -> 0.8f   // Medium text density
+            currentTextDensity > 0.1f -> 1.0f   // Low text density
+            else -> 1.2f                         // Very low: longer scroll
+        }
+        
+        val adjustedFactor = 1f + (densityFactor - 1f) * adaptiveResponseStrength
+        return (baseDistance * adjustedFactor).toInt().coerceIn(100, 800)
     }
 
     private fun createNotificationChannel() {
@@ -1588,5 +2407,334 @@ class ScrollerOverlayService : Service() {
         ERROR,
         STOPPED,
         DISABLED
+    }
+
+    /**
+     * Get the comic type emoji based on the current comic type setting
+     */
+    private fun getComicTypeEmoji(): String {
+        return when (comicType) {
+            "MANGA" -> "📚" // Open book emoji for manga
+            "MANHWA" -> "📖" // Page with curl emoji for manhwa
+            "MANHUA" -> "📘" // Blue book emoji for manhua
+            else -> "📚" // Default to manga emoji
+        }
+    }
+
+    /**
+     * Recursively find views with a specific tag in a ViewGroup
+     * @param parent The parent ViewGroup to search in
+     * @param tag The tag to search for
+     * @param action The action to perform on found views
+     */
+    private fun findViewsByTag(parent: ViewGroup, tag: String, action: (View) -> Unit) {
+        for (i in 0 until parent.childCount) {
+            val child = parent.getChildAt(i)
+            if (child.tag == tag) {
+                action(child)
+            }
+            if (child is ViewGroup) {
+                findViewsByTag(child, tag, action)
+            }
+        }
+    }
+
+    /**
+     * Record a user adjustment to scrolling speed for learning purposes
+     * @param contentType The type of content (e.g., "DENSE_TEXT", "PANEL_BOUNDARY", etc.)
+     * @param adjustedSpeed The speed the user adjusted to
+     */
+    private fun recordUserAdjustment(contentType: String, adjustedSpeed: Long) {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+            // Each content type has its own adjustment history
+            val adjustmentKey = "${KEY_USER_ADJUSTMENTS}_${comicType}_$contentType"
+
+            // Get existing adjustments or create new list
+            val existingAdjustmentsJson = prefs.getString(adjustmentKey, "[]")
+            val gson = com.google.gson.Gson()
+
+            // Create a list to hold our adjustments
+            val adjustments = ArrayList<UserAdjustment>()
+
+            // Parse existing adjustments if any
+            if (existingAdjustmentsJson != "[]") {
+                try {
+                    val jsonArray = com.google.gson.JsonParser.parseString(existingAdjustmentsJson).asJsonArray
+                    for (element in jsonArray) {
+                        val obj = element.asJsonObject
+                        val timestamp = obj.get("timestamp").asLong
+                        val speed = obj.get("speed").asLong
+                        val imgComplexity = obj.get("imageComplexity").asFloat
+                        val txtDensity = obj.get("textDensity").asFloat
+                        adjustments.add(UserAdjustment(timestamp, speed, imgComplexity, txtDensity))
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error parsing adjustments JSON", e)
+                    // Continue with empty list if there's a parsing error
+                }
+            }
+
+            // Add new adjustment with timestamp
+            adjustments.add(UserAdjustment(System.currentTimeMillis(), adjustedSpeed, imageComplexity, currentTextDensity))
+
+            // Keep only the most recent 100 adjustments
+            while (adjustments.size > 100) {
+                adjustments.removeAt(0)
+            }
+
+            // Save back to preferences
+            val updatedJson = gson.toJson(adjustments)
+            prefs.edit().putString(adjustmentKey, updatedJson).apply()
+
+            Log.d(TAG, "Recorded user adjustment for $contentType: $adjustedSpeed ms")
+
+            // Periodically analyze patterns and update behavior model
+            if (adjustments.size % 10 == 0) {
+                updateScrollBehaviorModel()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error recording user adjustment", e)
+        }
+    }
+
+    /**
+     * Update the scroll behavior model based on learned patterns
+     */
+    private fun updateScrollBehaviorModel() {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+            // For each content type and comic type, analyze adjustments
+            val contentTypes = listOf("DENSE_TEXT", "PANEL_BOUNDARY", "IMAGE_HEAVY", "AUTO_PANEL", "MANUAL")
+
+            for (contentType in contentTypes) {
+                val adjustmentKey = "${KEY_USER_ADJUSTMENTS}_${comicType}_$contentType"
+                val adjustmentsJson = prefs.getString(adjustmentKey, "[]") ?: "[]"
+
+                // Skip if no data
+                if (adjustmentsJson == "[]") continue
+
+                // Parse adjustments
+                val adjustments = ArrayList<UserAdjustment>()
+                val gson = com.google.gson.Gson()
+                val jsonArray = com.google.gson.JsonParser.parseString(adjustmentsJson).asJsonArray
+
+                for (element in jsonArray) {
+                    val obj = element.asJsonObject
+                    val timestamp = obj.get("timestamp").asLong
+                    val speed = obj.get("speed").asLong
+                    val imgComplexity = obj.get("imageComplexity").asFloat
+                    val txtDensity = obj.get("textDensity").asFloat
+                    adjustments.add(UserAdjustment(timestamp, speed, imgComplexity, txtDensity))
+                }
+
+                if (adjustments.size < 5) continue // Need more data
+
+                // Calculate average speed for this content type
+                var totalSpeed = 0L
+                for (adjustment in adjustments) {
+                    totalSpeed += adjustment.speed
+                }
+                val avgSpeed = totalSpeed / adjustments.size
+
+                // Store the learned speed in preferences
+                val learnedSpeedKey = "LEARNED_SPEED_${comicType}_$contentType"
+                prefs.edit().putLong(learnedSpeedKey, avgSpeed).apply()
+
+                Log.d(TAG, "Updated learned speed for $comicType/$contentType: $avgSpeed ms")
+            }
+
+            // Calculate correlation between text density, image complexity and speed
+            calculateCorrelations()
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating scroll behavior model", e)
+        }
+    }
+
+    /**
+     * Calculate correlations between content characteristics and speed
+     */
+    private fun calculateCorrelations() {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+            // Get all manual adjustments
+            val manualAdjustmentKey = "${KEY_USER_ADJUSTMENTS}_${comicType}_MANUAL"
+            val adjustmentsJson = prefs.getString(manualAdjustmentKey, "[]") ?: "[]"
+
+            // Skip if no data
+            if (adjustmentsJson == "[]") return
+
+            // Parse adjustments
+            val adjustments = ArrayList<UserAdjustment>()
+            val gson = com.google.gson.Gson()
+            val jsonArray = com.google.gson.JsonParser.parseString(adjustmentsJson).asJsonArray
+
+            for (element in jsonArray) {
+                val obj = element.asJsonObject
+                val timestamp = obj.get("timestamp").asLong
+                val speed = obj.get("speed").asLong
+                val imgComplexity = obj.get("imageComplexity").asFloat
+                val txtDensity = obj.get("textDensity").asFloat
+                adjustments.add(UserAdjustment(timestamp, speed, imgComplexity, txtDensity))
+            }
+
+            if (adjustments.size < 10) return // Need more data
+
+            // Calculate correlation between text density and speed
+            var sumTextDensity = 0.0f
+            var sumSpeed = 0L
+            var sumTextDensitySquared = 0.0f
+            var sumSpeedSquared = 0L
+            var sumTextDensitySpeed = 0.0f
+
+            for (adjustment in adjustments) {
+                sumTextDensity += adjustment.textDensity
+                sumSpeed += adjustment.speed
+                sumTextDensitySquared += adjustment.textDensity * adjustment.textDensity
+                sumSpeedSquared += adjustment.speed * adjustment.speed
+                sumTextDensitySpeed += adjustment.textDensity * adjustment.speed.toFloat()
+            }
+
+            val n = adjustments.size
+
+            // Calculate correlation coefficient
+            val numeratorText = (n * sumTextDensitySpeed - sumTextDensity * sumSpeed.toFloat())
+            val denominatorText1 = (n * sumTextDensitySquared - sumTextDensity * sumTextDensity)
+            val denominatorText2 = (n * sumSpeedSquared - sumSpeed * sumSpeed)
+
+            val textDensitySpeedCorrelation = if (denominatorText1 > 0 && denominatorText2 > 0) {
+                numeratorText / Math.sqrt((denominatorText1 * denominatorText2).toDouble()).toFloat()
+            } else {
+                0.0f
+            }
+
+            // Save correlation
+            prefs.edit().putFloat("TEXT_DENSITY_SPEED_CORRELATION", textDensitySpeedCorrelation).apply()
+
+            // Similar calculation for image complexity
+            var sumImageComplexity = 0.0f
+            var sumImageComplexitySquared = 0.0f
+            var sumImageComplexitySpeed = 0.0f
+
+            for (adjustment in adjustments) {
+                sumImageComplexity += adjustment.imageComplexity
+                sumImageComplexitySquared += adjustment.imageComplexity * adjustment.imageComplexity
+                sumImageComplexitySpeed += adjustment.imageComplexity * adjustment.speed.toFloat()
+            }
+
+            // Calculate correlation coefficient
+            val numeratorImage = (n * sumImageComplexitySpeed - sumImageComplexity * sumSpeed.toFloat())
+            val denominatorImage1 = (n * sumImageComplexitySquared - sumImageComplexity * sumImageComplexity)
+            val denominatorImage2 = (n * sumSpeedSquared - sumSpeed * sumSpeed)
+
+            val imageComplexitySpeedCorrelation = if (denominatorImage1 > 0 && denominatorImage2 > 0) {
+                numeratorImage / Math.sqrt((denominatorImage1 * denominatorImage2).toDouble()).toFloat()
+            } else {
+                0.0f
+            }
+
+            prefs.edit().putFloat("IMAGE_COMPLEXITY_SPEED_CORRELATION", imageComplexitySpeedCorrelation).apply()
+
+            // Based on correlations, adjust weights for adaptive scrolling
+            val textDensityWeight = 0.5f + (Math.abs(textDensitySpeedCorrelation) * 0.5f)
+            val imageComplexityWeight = 0.5f + (Math.abs(imageComplexitySpeedCorrelation) * 0.5f)
+
+            // Normalize weights
+            val totalWeight = textDensityWeight + imageComplexityWeight
+            val normalizedTextWeight = textDensityWeight / totalWeight
+            val normalizedImageWeight = imageComplexityWeight / totalWeight
+
+            prefs.edit()
+                .putFloat("ADAPTIVE_TEXT_WEIGHT", normalizedTextWeight)
+                .putFloat("ADAPTIVE_IMAGE_WEIGHT", normalizedImageWeight)
+                .apply()
+
+            Log.d(TAG, "Updated correlation model - Text: $textDensitySpeedCorrelation (weight: $normalizedTextWeight), " +
+                    "Image: $imageComplexitySpeedCorrelation (weight: $normalizedImageWeight)")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error calculating correlations", e)
+        }
+    }
+
+    /**
+     * Get learned speed for current content type
+     */
+    private fun getLearnedSpeed(contentType: String): Long {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val learnedSpeedKey = "LEARNED_SPEED_${comicType}_$contentType"
+        return prefs.getLong(learnedSpeedKey, baseScrollSpeed)
+    }
+
+    /**
+     * Data class to store user adjustments
+     */
+    data class UserAdjustment(
+        val timestamp: Long,
+        val speed: Long,
+        val imageComplexity: Float,
+        val textDensity: Float
+    )
+
+    /**
+     * Apply the scroll distance setting to the actual scroll speed
+     */
+    private fun applyScrollDistanceToSpeed() {
+        // Apply scroll distance multiplier to base speed
+        val distanceFactor = when(scrollDistance) {
+            "SHORT" -> 0.5f
+            "MEDIUM" -> 1.0f
+            "LONG" -> 2.0f
+            else -> 1.0f
+        }
+
+        // Update current scroll speed based on base speed and distance factor
+        currentScrollSpeed = (baseScrollSpeed * distanceFactor).toLong()
+
+        // If scrolling is active, update the scroll job with new speed
+        if (isScrolling) {
+            stopScrolling()
+            startScrolling()
+        }
+
+        Log.d(TAG, "Applied scroll distance: $scrollDistance (factor: $distanceFactor, speed: $currentScrollSpeed)")
+    }
+
+    /**
+     * Setup touch handling for moving the overlay around the screen
+     */
+    private fun setupDragToMove() {
+        overlayView?.setOnTouchListener { _, event ->
+            if (layoutParams == null) return@setOnTouchListener false
+
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    // Record initial positions
+                    initialX = layoutParams!!.x
+                    initialY = layoutParams!!.y
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    // Calculate new position
+                    val newX = initialX + (event.rawX - initialTouchX).toInt()
+                    val newY = initialY + (event.rawY - initialTouchY).toInt()
+
+                    // Update the layout
+                    layoutParams!!.x = newX
+                    layoutParams!!.y = newY
+                    windowManager?.updateViewLayout(overlayView, layoutParams)
+                    true
+                }
+                else -> false
+            }
+        }
+
+        Log.d(TAG, "Drag-to-move setup complete")
     }
 }

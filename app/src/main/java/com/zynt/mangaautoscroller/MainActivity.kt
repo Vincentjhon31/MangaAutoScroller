@@ -33,9 +33,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.zynt.mangaautoscroller.data.model.GitHubRelease
+import com.zynt.mangaautoscroller.data.repository.UpdateRepository
 import com.zynt.mangaautoscroller.service.ScrollerOverlayService
 import com.zynt.mangaautoscroller.ui.SettingsDialog
+import com.zynt.mangaautoscroller.ui.components.UpdateAvailableDialog
 import com.zynt.mangaautoscroller.ui.theme.MangaAutoScrollerTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -44,6 +50,11 @@ class MainActivity : ComponentActivity() {
     // MediaProjection for screen capture and OCR
     private var mediaProjectionData: Intent? = null
 
+    // Update checker
+    private val updateRepository = UpdateRepository()
+    private var availableUpdate by mutableStateOf<GitHubRelease?>(null)
+    private var showUpdateDialog by mutableStateOf(false)
+
     // Settings state with shared preferences backing
     private var scrollSpeed by mutableStateOf(2.0f)
     private var overlayOpacity by mutableStateOf(0.85f)
@@ -51,6 +62,7 @@ class MainActivity : ComponentActivity() {
     private var adaptiveScrollingEnabled by mutableStateOf(true)
     private var textDetectionSensitivity by mutableStateOf(1.0f)
     private var adaptiveResponseStrength by mutableStateOf(1.0f)
+    private var mlDetectionEnabled by mutableStateOf(false) // Use ML bubble detection instead of ML Kit
     private var showSettingsDialog by mutableStateOf(false)
 
     // Shared preferences constants
@@ -63,6 +75,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_SENSITIVITY = "text_sensitivity"
         private const val KEY_RESPONSE_STRENGTH = "response_strength"
         private const val KEY_OCR_ENABLED = "ocr_enabled"
+        private const val KEY_ML_DETECTION_ENABLED = "ml_detection_enabled"
         private const val KEY_MEDIA_PROJECTION_DATA = "media_projection_data"
     }
 
@@ -104,9 +117,20 @@ class MainActivity : ComponentActivity() {
         checkAllPermissions()
         // Check service status periodically
         checkServiceStatus()
+        
+        // Check for app updates
+        checkForUpdates()
 
         setContent {
             MangaAutoScrollerTheme {
+                // Update Available Dialog
+                if (showUpdateDialog && availableUpdate != null) {
+                    UpdateAvailableDialog(
+                        release = availableUpdate!!,
+                        onDismiss = { showUpdateDialog = false }
+                    )
+                }
+                
                 // Settings Dialog
                 if (showSettingsDialog) {
                     SettingsDialog(
@@ -124,6 +148,11 @@ class MainActivity : ComponentActivity() {
                         overlayOpacity = overlayOpacity,
                         onOverlayOpacityChange = {
                             overlayOpacity = it
+                            saveSettings()
+                        },
+                        mlDetectionEnabled = mlDetectionEnabled,
+                        onMlDetectionEnabledChange = {
+                            mlDetectionEnabled = it
                             saveSettings()
                         },
                         onReset = {
@@ -183,6 +212,24 @@ class MainActivity : ComponentActivity() {
         // Recheck permissions and service status when returning to the app
         checkAllPermissions()
         checkServiceStatus()
+    }
+
+    /**
+     * Check for app updates from GitHub releases
+     */
+    private fun checkForUpdates() {
+        CoroutineScope(Dispatchers.Main).launch {
+            try {
+                val release = updateRepository.checkForUpdates()
+                if (release != null) {
+                    Log.i(TAG, "📦 Update available: ${release.tagName}")
+                    availableUpdate = release
+                    showUpdateDialog = true
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to check for updates", e)
+            }
+        }
     }
 
     private fun checkAllPermissions() {
@@ -281,11 +328,22 @@ class MainActivity : ComponentActivity() {
             intent.putExtra(KEY_SENSITIVITY, textDetectionSensitivity)
             intent.putExtra(KEY_RESPONSE_STRENGTH, adaptiveResponseStrength)
             intent.putExtra(KEY_OCR_ENABLED, ocrEnabled)
+            intent.putExtra(KEY_ML_DETECTION_ENABLED, mlDetectionEnabled)
 
-            // Pass MediaProjection result data to the service if OCR is enabled
-            if (ocrEnabled && mediaProjectionData != null) {
+            // Pass MediaProjection result data to the service if OCR or ML detection is enabled
+            // Both OCR (ML Kit) and ML Bubble Detection need screen capture
+            val needsScreenCapture = ocrEnabled || mlDetectionEnabled
+            if (needsScreenCapture && mediaProjectionData != null) {
                 intent.putExtra(KEY_MEDIA_PROJECTION_DATA, mediaProjectionData)
-                Log.d(TAG, "Passing MediaProjection data to service for OCR")
+                val mode = when {
+                    ocrEnabled && mlDetectionEnabled -> "OCR + ML Detection"
+                    mlDetectionEnabled -> "ML Bubble Detection"
+                    else -> "OCR"
+                }
+                Log.d(TAG, "Passing MediaProjection data to service for $mode")
+            } else if (needsScreenCapture && mediaProjectionData == null) {
+                Log.w(TAG, "⚠️ Screen capture requested but MediaProjection data not available. Please grant screen capture permission.")
+                Toast.makeText(this, "⚠️ Please grant screen capture permission for detection to work", Toast.LENGTH_LONG).show()
             }
 
             // Start the service
@@ -295,7 +353,8 @@ class MainActivity : ComponentActivity() {
                 startService(intent)
             }
 
-            Toast.makeText(this, "🚀 Manga Auto Scroller Started!", Toast.LENGTH_SHORT).show()
+            val detectionMode = if (mlDetectionEnabled) "ML Bubble Detection" else "ML Kit OCR"
+            Toast.makeText(this, "🚀 Manga Auto Scroller Started! ($detectionMode)", Toast.LENGTH_SHORT).show()
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start service", e)
@@ -335,13 +394,34 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadSettings() {
-        val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        scrollSpeed = sharedPreferences.getFloat(KEY_SCROLL_SPEED, 2.0f)
-        overlayOpacity = sharedPreferences.getFloat(KEY_OPACITY, 0.85f)
-        ocrEnabled = sharedPreferences.getBoolean(KEY_OCR_ENABLED, true)
-        adaptiveScrollingEnabled = sharedPreferences.getBoolean(KEY_ADAPTIVE_ENABLED, true)
-        textDetectionSensitivity = sharedPreferences.getFloat(KEY_SENSITIVITY, 1.0f)
-        adaptiveResponseStrength = sharedPreferences.getFloat(KEY_RESPONSE_STRENGTH, 1.0f)
+        try {
+            val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+            // Handle potential type mismatch for scrollSpeed
+            try {
+                scrollSpeed = sharedPreferences.getFloat(KEY_SCROLL_SPEED, 2.0f)
+            } catch (e: ClassCastException) {
+                // It might be saved as Long in the service
+                Log.w(TAG, "Converting scroll speed from Long to Float")
+                val longValue = sharedPreferences.getLong(KEY_SCROLL_SPEED, 2000L)
+                scrollSpeed = (longValue / 1000f)
+                // Save it back as Float to prevent future errors
+                sharedPreferences.edit().putFloat(KEY_SCROLL_SPEED, scrollSpeed).apply()
+            }
+
+            // Load other settings normally
+            overlayOpacity = sharedPreferences.getFloat(KEY_OPACITY, 0.85f)
+            ocrEnabled = sharedPreferences.getBoolean(KEY_OCR_ENABLED, true)
+            adaptiveScrollingEnabled = sharedPreferences.getBoolean(KEY_ADAPTIVE_ENABLED, true)
+            textDetectionSensitivity = sharedPreferences.getFloat(KEY_SENSITIVITY, 1.0f)
+            adaptiveResponseStrength = sharedPreferences.getFloat(KEY_RESPONSE_STRENGTH, 1.0f)
+            mlDetectionEnabled = sharedPreferences.getBoolean(KEY_ML_DETECTION_ENABLED, false)
+
+            Log.d(TAG, "Settings loaded: speed=$scrollSpeed, opacity=$overlayOpacity, mlDetection=$mlDetectionEnabled")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading settings", e)
+            // If loading fails, we'll use the default values
+        }
     }
 
     private fun saveSettings() {
@@ -353,6 +433,7 @@ class MainActivity : ComponentActivity() {
             putBoolean(KEY_ADAPTIVE_ENABLED, adaptiveScrollingEnabled)
             putFloat(KEY_SENSITIVITY, textDetectionSensitivity)
             putFloat(KEY_RESPONSE_STRENGTH, adaptiveResponseStrength)
+            putBoolean(KEY_ML_DETECTION_ENABLED, mlDetectionEnabled)
             apply()
         }
     }
@@ -364,6 +445,7 @@ class MainActivity : ComponentActivity() {
         adaptiveScrollingEnabled = true
         textDetectionSensitivity = 1.0f
         adaptiveResponseStrength = 1.0f
+        mlDetectionEnabled = false
         saveSettings()
     }
 }

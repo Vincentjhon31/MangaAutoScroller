@@ -1,0 +1,236 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "🚀 Build & Run",
+      "dependsOn": ["Build Debug APK", "Install Debug APK", "Launch App"],
+      "dependsOrder": "sequence",
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Build Debug APK",
+      "type": "shell",
+      "command": ".\\gradlew.bat",
+      "args": ["assembleDebug", "--warning-mode", "all"],
+      "problemMatcher": ["$gradle"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "showReuseMessage": false
+      },
+      "group": "build"
+    },
+    {
+      "label": "Build Release APK",
+      "type": "shell",
+      "command": ".\\gradlew.bat",
+      "args": ["assembleRelease"],
+      "problemMatcher": ["$gradle"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "group": "build"
+    },
+    {
+      "label": "Install Debug APK",
+      "type": "shell",
+      "command": "adb",
+      "args": [
+        "install",
+        "-r",
+        "app\\build\\outputs\\apk\\debug\\app-debug.apk"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Launch App",
+      "type": "shell",
+      "command": "adb",
+      "args": [
+        "shell",
+        "am",
+        "start",
+        "-n",
+        "com.zynt.mangaautoscroller/.MainActivity"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "🧹 Clean Project",
+      "type": "shell",
+      "command": ".\\gradlew.bat",
+      "args": ["clean"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "group": "build"
+    },
+    {
+      "label": "🔄 Clean & Build Debug",
+      "dependsOn": ["🧹 Clean Project", "Build Debug APK"],
+      "dependsOrder": "sequence",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "📱 Show Connected Devices",
+      "type": "shell",
+      "command": "adb",
+      "args": ["devices", "-l"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "📋 Logcat (All App Logs)",
+      "type": "shell",
+      "command": "adb",
+      "args": [
+        "logcat",
+        "-v",
+        "time",
+        "*:S",
+        "ScrollerOverlayService:*",
+        "BubbleDetector:*",
+        "ModelManager:*",
+        "MangaAutoScroller:*",
+        "ScrollerAccessibilityService:*",
+        "PanelDetector:*",
+        "*:E"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "logcat"
+      },
+      "isBackground": true
+    },
+    {
+      "label": "📋 Logcat (ML Detection Only)",
+      "type": "shell",
+      "command": "adb",
+      "args": [
+        "logcat",
+        "-v",
+        "time",
+        "*:S",
+        "BubbleDetector:*",
+        "ModelManager:*"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "logcat"
+      },
+      "isBackground": true
+    },
+    {
+      "label": "📋 Logcat (Errors Only)",
+      "type": "shell",
+      "command": "adb",
+      "args": ["logcat", "-v", "time", "*:E"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "logcat"
+      },
+      "isBackground": true
+    },
+    {
+      "label": "🗑️ Clear Logcat",
+      "type": "shell",
+      "command": "adb",
+      "args": ["logcat", "-c"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "❌ Uninstall App",
+      "type": "shell",
+      "command": "adb",
+      "args": ["uninstall", "com.zynt.mangaautoscroller"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "🔌 Stop App",
+      "type": "shell",
+      "command": "adb",
+      "args": ["shell", "am", "force-stop", "com.zynt.mangaautoscroller"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "🧪 Run Unit Tests",
+      "type": "shell",
+      "command": ".\\gradlew.bat",
+      "args": ["test"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "group": "test"
+    },
+    {
+      "label": "📊 Gradle Dependencies",
+      "type": "shell",
+      "command": ".\\gradlew.bat",
+      "args": ["app:dependencies"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "📱 Device Info",
+      "type": "shell",
+      "command": "adb devices -l && echo. && echo === Device Details === && for /f \"tokens=1\" %d in ('adb devices ^| findstr device$') do @(echo Device: %d && adb -s %d shell getprop ro.product.model && adb -s %d shell getprop ro.build.version.release)",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "🔄 Restart ADB Server",
+      "type": "shell",
+      "command": "adb kill-server && adb start-server && echo ADB Server Restarted && adb devices",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ]
+}

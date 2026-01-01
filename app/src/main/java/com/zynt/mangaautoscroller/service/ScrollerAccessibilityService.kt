@@ -123,6 +123,57 @@ class ScrollerAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Performs a scroll action with specific distance
+     * @param direction Direction to scroll
+     * @param distance Distance in pixels to scroll
+     */
+    fun performScrollWithDistance(direction: Int, distance: Int) {
+        try {
+            val displayMetrics = resources.displayMetrics
+            val screenWidth = displayMetrics.widthPixels
+            val screenHeight = displayMetrics.heightPixels
+
+            val path = Path()
+
+            when (direction) {
+                DIRECTION_DOWN -> {
+                    // Swipe from top to bottom with specified distance
+                    path.moveTo(screenWidth / 2f, screenHeight / 3f)
+                    path.lineTo(screenWidth / 2f, screenHeight / 3f + distance)
+                }
+                DIRECTION_UP -> {
+                    // Swipe from bottom to top with specified distance
+                    path.moveTo(screenWidth / 2f, screenHeight * 2 / 3f)
+                    path.lineTo(screenWidth / 2f, screenHeight * 2 / 3f - distance)
+                }
+                DIRECTION_RIGHT -> {
+                    // Swipe from left to right with specified distance
+                    path.moveTo(screenWidth / 3f, screenHeight / 2f)
+                    path.lineTo(screenWidth / 3f + distance, screenHeight / 2f)
+                }
+                DIRECTION_LEFT -> {
+                    // Swipe from right to left with specified distance
+                    path.moveTo(screenWidth * 2 / 3f, screenHeight / 2f)
+                    path.lineTo(screenWidth * 2 / 3f - distance, screenHeight / 2f)
+                }
+            }
+
+            // Create and dispatch the gesture
+            val scrollStroke = GestureDescription.StrokeDescription(path, 0, 300) // Fixed 300ms duration
+
+            val gestureDescription = GestureDescription.Builder()
+                .addStroke(scrollStroke)
+                .build()
+
+            dispatchGesture(gestureDescription, null, null)
+
+            Log.d(TAG, "Performed scroll with direction=$direction, distance=$distance pixels")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error performing scroll with distance", e)
+        }
+    }
+
     override fun onUnbind(intent: Intent?): Boolean {
         instance = null
         Log.d(TAG, "Accessibility service unbound")

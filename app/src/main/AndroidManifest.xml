@@ -41,7 +41,12 @@
             android:name=".service.ScrollerOverlayService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection|specialUse">
+            <!-- Required for FOREGROUND_SERVICE_SPECIAL_USE on Android 14+ -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="manga_auto_scroll_overlay" />
+        </service>
 
         <!-- Main Accessibility Service for scrolling -->
         <service
