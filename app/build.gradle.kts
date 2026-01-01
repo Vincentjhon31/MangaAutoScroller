@@ -94,6 +94,9 @@ dependencies {
     
     // Fragment KTX - Required for registerForActivityResult
     implementation("androidx.fragment:fragment-ktx:1.6.2")
+    
+    // DocumentFile - Required for file/directory operations
+    implementation("androidx.documentfile:documentfile:1.0.1")
 
     // Add Gson for JSON serialization
     implementation("com.google.code.gson:gson:2.10.1")
